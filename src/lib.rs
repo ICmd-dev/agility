@@ -3,6 +3,10 @@ use std::{
     rc::{Rc, Weak},
 };
 
+thread_local! {
+    static GLOBAL_BATCH_STATE: BatchState = BatchState::new();
+}
+
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }
@@ -13,83 +17,491 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+        let signal = Signal::new(5);
+        let signal_r = signal.map(|x| {
+            let new = x + 1;
+            println!("signal_r: {}", new);
+            new
+        });
+        let signal_l = signal.map(|x| {
+            let new = x * 2;
+            println!("signal_l: {}", new);
+            new
+        });
+        (signal_r, signal_l)
+            .lift()
+            .map(|(r, l)| println!("({}, {})", r, l));
+        println!("Sending 7...");
+        signal.send(7);
     }
-}
 
-pub trait Responsive<T = Self>
-where
-    T: ?Sized,
-{
-    fn before_change(&self);
-    fn after_change(&self);
-}
+    #[test]
+    fn test_sequence() {
+        let s1 = Signal::new(1);
+        let s2 = Signal::new(2);
+        let s3 = Signal::new(3);
 
-struct ResponsiveInner<'a, T: ?Sized> {
-    successor_before_changes: Vec<Box<dyn Fn() + 'a>>,
-    successor_after_changes: Vec<Box<dyn Fn() + 'a>>,
-    value: T,
-}
+        let seq = [s1.clone(), s2.clone(), s3.clone()].lift();
+        seq.map(|v| {
+            println!("Sequence: {:?}", v);
+        });
 
-pub struct ResponsiveRef<'a, T: ?Sized> {
-    inner: Rc<RefCell<ResponsiveInner<'a, T>>>,
-}
+        println!("Updating individually...");
+        s1.send(10);
+        s2.send(20);
+        s3.send(30);
 
-impl<'a, T> ResponsiveRef<'a, T> {
-    pub fn new(value: T) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(ResponsiveInner {
-                successor_before_changes: Vec::new(),
-                successor_after_changes: Vec::new(),
-                value,
-            })),
+        println!("Batching updates...");
+        (
+            s1.send(100),
+            s2.send(200),
+            s3.send(300),
+            println!("All sends called, waiting for drop..."),
+        );
+        println!("Batch complete!");
+    }
+
+    #[test]
+    fn test_batch() {
+        let signal = Signal::new(0);
+        let _mapped = signal.map(|x| {
+            println!("Mapped value: {}", x);
+            *x
+        });
+
+        println!("Non-batched sends (each triggers immediately):");
+        signal.send(1);
+        signal.send(2);
+
+        println!("\nBatched sends (triggers once after scope):");
+        {
+            let _g1 = signal.send(10);
+            let _g2 = signal.send(20);
+            println!("Inside batch scope - no notification yet");
         }
+        println!("Batch complete - notification fired!\n");
     }
-}
 
-impl<'a, T: Responsive> ResponsiveRef<'a, T> {
-    pub fn map<U, F>(&'a self, f: F) -> ResponsiveRef<'a, U>
-    where
-        U: Responsive + 'static,
-        F: Fn(&T) -> U,
-    {
-        let new_value = f(&self.inner.borrow().value);
-        let new_rc = ResponsiveRef::new(new_value);
-        let new_weak = Rc::downgrade(&new_rc.inner);
-        self.inner
-            .borrow_mut()
-            .successor_before_changes
-            .push(Box::new(move || {
-                if let Some(new_strong) = new_weak.upgrade() {
-                    new_strong.borrow().value.before_change();
-                }
-            }));
-        let new_weak = Rc::downgrade(&new_rc.inner);
-        self.inner
-            .borrow_mut()
-            .successor_after_changes
-            .push(Box::new(move || {
-                if let Some(new_strong) = new_weak.upgrade() {
-                    new_strong.borrow().value.after_change();
-                }
-            }));
-        new_rc
-    }
-    pub fn set(&self, new_value: T) {
-        let inner_ref = self.inner.borrow();
-        inner_ref.value.before_change();
-        for successor_before_change in &inner_ref.successor_before_changes {
-            successor_before_change();
+    #[test]
+    fn test_batch_combine() {
+        let x = Signal::new(1);
+        let y = Signal::new(2);
+
+        let combined = x.combine(&y);
+        combined.map(|(a, b)| {
+            println!("Combined: ({}, {})", a, b);
+        });
+
+        println!("Non-batched - triggers twice:");
+        x.send(10);
+        y.send(20);
+
+        println!("\nBatched - triggers once:");
+        {
+            let _gx = x.send(100);
+            let _gy = y.send(200);
         }
-        self.inner.borrow_mut().value = new_value;
+        println!("Done!");
     }
 }
 
-impl<T: Responsive + ?Sized> Clone for ResponsiveRef<'_, T> {
+struct BatchState(Rc<RefCell<BatchStateInner>>);
+
+struct BatchStateInner {
+    depth: usize,
+    notified_signals: Vec<*const ()>,
+}
+
+impl Clone for BatchState {
     fn clone(&self) -> Self {
-        Self {
-            inner: Rc::clone(&self.inner),
+        BatchState(Rc::clone(&self.0))
+    }
+}
+
+impl BatchState {
+    fn new() -> Self {
+        BatchState(Rc::new(RefCell::new(BatchStateInner {
+            depth: 0,
+            notified_signals: Vec::new(),
+        })))
+    }
+
+    fn enter(&self) {
+        self.0.borrow_mut().depth += 1;
+    }
+
+    fn exit<T>(&self, signal: &SignalInner<T>) {
+        let mut state = self.0.borrow_mut();
+        state.depth = state.depth.saturating_sub(1);
+
+        if state.depth == 0 {
+            state.notified_signals.clear();
+            drop(state);
+
+            if *signal.needs_notification.borrow() {
+                *signal.needs_notification.borrow_mut() = false;
+                signal.notify_subscribers();
+            }
         }
     }
+}
+
+struct SignalInner<'a, T> {
+    value: RefCell<T>,
+    subscribers: RefCell<Vec<Box<dyn Fn() -> bool + 'a>>>,
+    needs_notification: RefCell<bool>,
+}
+
+pub struct Signal<'a, T>(Rc<SignalInner<'a, T>>);
+
+pub struct BatchGuard<'a, T>(Signal<'a, T>);
+
+impl<'a, T> Drop for BatchGuard<'a, T> {
+    fn drop(&mut self) {
+        GLOBAL_BATCH_STATE.with(|bs| bs.exit(&self.0.0));
+    }
+}
+
+impl<'a, T> Clone for Signal<'a, T> {
+    fn clone(&self) -> Self {
+        Signal(Rc::clone(&self.0))
+    }
+}
+
+impl<'a, T> Signal<'a, T> {
+    pub fn new(initial_value: T) -> Signal<'a, T> {
+        Signal(Rc::new(SignalInner {
+            value: RefCell::new(initial_value),
+            subscribers: RefCell::new(Vec::new()),
+            needs_notification: RefCell::new(false),
+        }))
+    }
+
+    pub fn send(&self, value: T) -> BatchGuard<'a, T> {
+        GLOBAL_BATCH_STATE.with(|bs| bs.enter());
+        *self.0.value.borrow_mut() = value;
+        *self.0.needs_notification.borrow_mut() = true;
+
+        BatchGuard(self.clone())
+    }
+
+    pub fn send_with<F>(&self, f: F) -> BatchGuard<'a, T>
+    where
+        F: FnOnce(&mut T),
+    {
+        GLOBAL_BATCH_STATE.with(|bs| bs.enter());
+        f(&mut self.0.value.borrow_mut());
+        *self.0.needs_notification.borrow_mut() = true;
+
+        BatchGuard(self.clone())
+    }
+
+    pub fn send_now(&self, value: T) {
+        *self.0.value.borrow_mut() = value;
+        self.0.notify_subscribers();
+    }
+
+    pub fn send_with_now<F>(&self, f: F)
+    where
+        F: FnOnce(&mut T),
+    {
+        f(&mut self.0.value.borrow_mut());
+        self.0.notify_subscribers();
+    }
+    pub fn map<F, U>(&self, f: F) -> Signal<'a, U>
+    where
+        F: Fn(&T) -> U + 'a,
+        U: 'a,
+        T: 'a,
+    {
+        // Default map uses strong Rc references to keep signals alive.
+        let new_signal = Signal::new(f(&self.0.value.borrow()));
+        let new_signal_clone = new_signal.clone();
+        let self_clone = self.clone();
+        let subscription = Box::new(move || {
+            let new_value = f(&self_clone.0.value.borrow());
+            new_signal_clone.send_now(new_value);
+            true
+        });
+        self.0.subscribers.borrow_mut().push(subscription);
+        new_signal
+    }
+
+    /// Map using weak references: if either signal is dropped, subscription is removed.
+    pub fn weak_map<F, U>(&self, f: F) -> Signal<'a, U>
+    where
+        F: Fn(&T) -> U + 'a,
+        U: 'a,
+        T: 'a,
+    {
+        // Original behavior captured weak references to avoid keeping signals alive.
+        let new_signal = Signal::new(f(&self.0.value.borrow()));
+        let weak_new_signal = Rc::downgrade(&new_signal.0);
+        let weak_self = Rc::downgrade(&self.0);
+        let subscription = Box::new(move || {
+            weak_new_signal
+                .upgrade()
+                .and_then(|new_signal_inner| {
+                    weak_self
+                        .upgrade()
+                        .map(|self_inner| (Signal(new_signal_inner), Signal(self_inner)))
+                })
+                .map(|(new_signal, self_signal)| {
+                    let new_value = f(&self_signal.0.value.borrow());
+                    new_signal.send_now(new_value);
+                    true
+                })
+                .unwrap_or(false)
+        });
+        self.0.subscribers.borrow_mut().push(subscription);
+        new_signal
+    }
+    pub fn combine<U>(&self, other: &Signal<'a, U>) -> Signal<'a, (T, U)>
+    where
+        U: Clone + 'a,
+        T: Clone + 'a,
+    {
+        combine_impl(self, other, false)
+    }
+
+    pub fn weak_combine<U>(&self, other: &Signal<'a, U>) -> Signal<'a, (T, U)>
+    where
+        U: Clone + 'a,
+        T: Clone + 'a,
+    {
+        combine_impl(self, other, true)
+    }
+
+    pub fn sequence(signals: &[Signal<'a, T>]) -> Signal<'a, Vec<T>>
+    where
+        T: Clone + 'a,
+    {
+        sequence_impl(signals, false)
+    }
+
+    pub fn weak_sequence(signals: &[Signal<'a, T>]) -> Signal<'a, Vec<T>>
+    where
+        T: Clone + 'a,
+    {
+        sequence_impl(signals, true)
+    }
+}
+
+impl<'a, T> SignalInner<'a, T> {
+    fn notify_subscribers(&self) {
+        let mut subscribers = self.subscribers.borrow_mut();
+        subscribers.retain(|subscriber| subscriber());
+    }
+}
+
+pub trait LiftInto<T> {
+    fn lift(self) -> T;
+}
+
+pub trait WeakLiftInto<T> {
+    fn weak_lift(self) -> T;
+}
+
+impl<'a, T, U> LiftInto<Signal<'a, (T, U)>> for (Signal<'a, T>, Signal<'a, U>)
+where
+    T: Clone + 'a,
+    U: Clone + 'a,
+{
+    fn lift(self) -> Signal<'a, (T, U)> {
+        self.0.combine(&self.1)
+    }
+}
+
+impl<'a, T, U> WeakLiftInto<Signal<'a, (T, U)>> for (Signal<'a, T>, Signal<'a, U>)
+where
+    T: Clone + 'a,
+    U: Clone + 'a,
+{
+    fn weak_lift(self) -> Signal<'a, (T, U)> {
+        self.0.weak_combine(&self.1)
+    }
+}
+
+impl<'a, T> LiftInto<Signal<'a, Vec<T>>> for &[Signal<'a, T>]
+where
+    T: Clone + 'a,
+{
+    fn lift(self) -> Signal<'a, Vec<T>> {
+        Signal::sequence(self)
+    }
+}
+
+impl<'a, T> LiftInto<Signal<'a, Vec<T>>> for Vec<Signal<'a, T>>
+where
+    T: Clone + 'a,
+{
+    fn lift(self) -> Signal<'a, Vec<T>> {
+        Signal::sequence(&self)
+    }
+}
+
+impl<'a, const N: usize, T> LiftInto<Signal<'a, Vec<T>>> for [Signal<'a, T>; N]
+where
+    T: Clone + 'a,
+{
+    fn lift(self) -> Signal<'a, Vec<T>> {
+        Signal::sequence(&self)
+    }
+}
+
+impl<'a, T> WeakLiftInto<Signal<'a, Vec<T>>> for &[Signal<'a, T>]
+where
+    T: Clone + 'a,
+{
+    fn weak_lift(self) -> Signal<'a, Vec<T>> {
+        Signal::weak_sequence(self)
+    }
+}
+
+impl<'a, T> WeakLiftInto<Signal<'a, Vec<T>>> for Vec<Signal<'a, T>>
+where
+    T: Clone + 'a,
+{
+    fn weak_lift(self) -> Signal<'a, Vec<T>> {
+        Signal::weak_sequence(&self)
+    }
+}
+
+impl<'a, const N: usize, T> WeakLiftInto<Signal<'a, Vec<T>>> for [Signal<'a, T>; N]
+where
+    T: Clone + 'a,
+{
+    fn weak_lift(self) -> Signal<'a, Vec<T>> {
+        Signal::weak_sequence(&self)
+    }
+}
+
+trait RefMode<'a> {
+    type Captured<T: 'a>;
+
+    fn capture<T: 'a>(signal: &Signal<'a, T>) -> Self::Captured<T>;
+    fn try_get<T: Clone + 'a>(captured: &Self::Captured<T>) -> Option<T>;
+}
+
+struct StrongRef;
+struct WeakRef;
+
+impl<'a> RefMode<'a> for StrongRef {
+    type Captured<T: 'a> = Signal<'a, T>;
+
+    fn capture<T: 'a>(signal: &Signal<'a, T>) -> Self::Captured<T> {
+        signal.clone()
+    }
+
+    fn try_get<T: Clone + 'a>(captured: &Self::Captured<T>) -> Option<T> {
+        Some(captured.0.value.borrow().clone())
+    }
+}
+
+impl<'a> RefMode<'a> for WeakRef {
+    type Captured<T: 'a> = Weak<SignalInner<'a, T>>;
+
+    fn capture<T: 'a>(signal: &Signal<'a, T>) -> Self::Captured<T> {
+        Rc::downgrade(&signal.0)
+    }
+
+    fn try_get<T: Clone + 'a>(captured: &Self::Captured<T>) -> Option<T> {
+        captured.upgrade().map(|inner| inner.value.borrow().clone())
+    }
+}
+
+fn combine_impl<'a, T, U>(
+    left: &Signal<'a, T>,
+    right: &Signal<'a, U>,
+    use_weak: bool,
+) -> Signal<'a, (T, U)>
+where
+    U: Clone + 'a,
+    T: Clone + 'a,
+{
+    let combined = Signal::new((
+        left.0.value.borrow().clone(),
+        right.0.value.borrow().clone(),
+    ));
+
+    let make_subscription = |left: &Signal<'a, T>, right: &Signal<'a, U>| {
+        if use_weak {
+            let cap_combined = WeakRef::capture(&combined);
+            let cap_left = WeakRef::capture(left);
+            let cap_right = WeakRef::capture(right);
+            Box::new(move || {
+                WeakRef::try_get(&cap_left)
+                    .zip(WeakRef::try_get(&cap_right))
+                    .zip(cap_combined.upgrade())
+                    .map(|((l, r), inner)| {
+                        Signal(inner).send_now((l, r));
+                        true
+                    })
+                    .unwrap_or(false)
+            }) as Box<dyn Fn() -> bool + 'a>
+        } else {
+            let cap_combined = StrongRef::capture(&combined);
+            let cap_left = StrongRef::capture(left);
+            let cap_right = StrongRef::capture(right);
+            Box::new(move || {
+                if let (Some(l), Some(r)) = (
+                    StrongRef::try_get(&cap_left),
+                    StrongRef::try_get(&cap_right),
+                ) {
+                    cap_combined.send_now((l, r));
+                }
+                true
+            }) as Box<dyn Fn() -> bool + 'a>
+        }
+    };
+
+    left.0
+        .subscribers
+        .borrow_mut()
+        .push(make_subscription(left, right));
+    right
+        .0
+        .subscribers
+        .borrow_mut()
+        .push(make_subscription(left, right));
+    combined
+}
+
+fn sequence_impl<'a, T>(signals: &[Signal<'a, T>], use_weak: bool) -> Signal<'a, Vec<T>>
+where
+    T: Clone + 'a,
+{
+    let sequenced = Signal::new(signals.iter().map(|s| s.0.value.borrow().clone()).collect());
+
+    for signal in signals {
+        let subscription = if use_weak {
+            let cap_sequenced = WeakRef::capture(&sequenced);
+            let cap_signals: Vec<_> = signals.iter().map(WeakRef::capture).collect();
+            Box::new(move || {
+                cap_sequenced
+                    .upgrade()
+                    .map(|inner| {
+                        let values: Option<Vec<_>> =
+                            cap_signals.iter().map(WeakRef::try_get).collect();
+                        if let Some(v) = values {
+                            Signal(inner).send_now(v);
+                        }
+                        true
+                    })
+                    .unwrap_or(false)
+            }) as Box<dyn Fn() -> bool + 'a>
+        } else {
+            let cap_sequenced = StrongRef::capture(&sequenced);
+            let cap_signals: Vec<_> = signals.iter().map(StrongRef::capture).collect();
+            Box::new(move || {
+                let values: Vec<_> = cap_signals.iter().filter_map(StrongRef::try_get).collect();
+                cap_sequenced.send_now(values);
+                true
+            }) as Box<dyn Fn() -> bool + 'a>
+        };
+
+        signal.0.subscribers.borrow_mut().push(subscription);
+    }
+
+    sequenced
 }
