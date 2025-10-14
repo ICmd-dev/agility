@@ -1,7 +1,4 @@
-use std::{
-    cell::RefCell,
-    rc::{Rc, Weak},
-};
+use std::{cell::RefCell, rc::Rc};
 
 thread_local! {
     static GLOBAL_BATCH_STATE: BatchState = BatchState::new();
@@ -376,40 +373,6 @@ where
     }
 }
 
-trait RefMode<'a> {
-    type Captured<T: 'a>;
-
-    fn capture<T: 'a>(signal: &Signal<'a, T>) -> Self::Captured<T>;
-    fn try_get<T: Clone + 'a>(captured: &Self::Captured<T>) -> Option<T>;
-}
-
-struct StrongRef;
-struct WeakRef;
-
-impl<'a> RefMode<'a> for StrongRef {
-    type Captured<T: 'a> = Signal<'a, T>;
-
-    fn capture<T: 'a>(signal: &Signal<'a, T>) -> Self::Captured<T> {
-        signal.clone()
-    }
-
-    fn try_get<T: Clone + 'a>(captured: &Self::Captured<T>) -> Option<T> {
-        Some(captured.0.value.borrow().clone())
-    }
-}
-
-impl<'a> RefMode<'a> for WeakRef {
-    type Captured<T: 'a> = Weak<SignalInner<'a, T>>;
-
-    fn capture<T: 'a>(signal: &Signal<'a, T>) -> Self::Captured<T> {
-        Rc::downgrade(&signal.0)
-    }
-
-    fn try_get<T: Clone + 'a>(captured: &Self::Captured<T>) -> Option<T> {
-        captured.upgrade().map(|inner| inner.value.borrow().clone())
-    }
-}
-
 fn combine_impl<'a, T, U>(
     left: &Signal<'a, T>,
     right: &Signal<'a, U>,
@@ -419,83 +382,99 @@ where
     U: Clone + 'a,
     T: Clone + 'a,
 {
-    let combined = Signal::new((
+    let new_combined = Signal::new((
         left.0.value.borrow().clone(),
         right.0.value.borrow().clone(),
     ));
 
-    let make_subscription = |left: &Signal<'a, T>, right: &Signal<'a, U>| {
-        if use_weak {
-            let cap_combined = WeakRef::capture(&combined);
-            let cap_left = WeakRef::capture(left);
-            let cap_right = WeakRef::capture(right);
-            Box::new(move || {
-                WeakRef::try_get(&cap_left)
-                    .zip(WeakRef::try_get(&cap_right))
-                    .zip(cap_combined.upgrade())
-                    .map(|((l, r), inner)| {
-                        Signal(inner).send_now((l, r));
-                        true
-                    })
-                    .unwrap_or(false)
-            }) as Box<dyn Fn() -> bool + 'a>
-        } else {
-            let cap_combined = StrongRef::capture(&combined);
-            let cap_left = StrongRef::capture(left);
-            let cap_right = StrongRef::capture(right);
-            Box::new(move || {
-                if let (Some(l), Some(r)) = (
-                    StrongRef::try_get(&cap_left),
-                    StrongRef::try_get(&cap_right),
-                ) {
-                    cap_combined.send_now((l, r));
-                }
-                true
-            }) as Box<dyn Fn() -> bool + 'a>
-        }
-    };
+    let create_subscription =
+        |signal: &Signal<'a, T>, right: &Signal<'a, U>, combined: &Signal<'a, (T, U)>| {
+            if use_weak {
+                let weak_combined = Rc::downgrade(&combined.0);
+                let weak_signal = Rc::downgrade(&signal.0);
+                let weak_right = Rc::downgrade(&right.0);
+                Box::new(move || {
+                    weak_combined
+                        .upgrade()
+                        .zip(weak_signal.upgrade())
+                        .zip(weak_right.upgrade())
+                        .map(|((combined_inner, signal_inner), right_inner)| {
+                            let combined = Signal(combined_inner);
+                            let new_value = (
+                                signal_inner.value.borrow().clone(),
+                                right_inner.value.borrow().clone(),
+                            );
+                            combined.send_now(new_value);
+                            true
+                        })
+                        .unwrap_or(false)
+                }) as Box<dyn Fn() -> bool + 'a>
+            } else {
+                let combined = combined.clone();
+                let signal = signal.clone();
+                let right = right.clone();
+                Box::new(move || {
+                    let new_value = (
+                        signal.0.value.borrow().clone(),
+                        right.0.value.borrow().clone(),
+                    );
+                    combined.send_now(new_value);
+                    true
+                }) as Box<dyn Fn() -> bool + 'a>
+            }
+        };
 
     left.0
         .subscribers
         .borrow_mut()
-        .push(make_subscription(left, right));
+        .push(create_subscription(left, right, &new_combined));
     right
         .0
         .subscribers
         .borrow_mut()
-        .push(make_subscription(left, right));
-    combined
+        .push(create_subscription(left, right, &new_combined));
+
+    new_combined
 }
 
 fn sequence_impl<'a, T>(signals: &[Signal<'a, T>], use_weak: bool) -> Signal<'a, Vec<T>>
 where
     T: Clone + 'a,
 {
-    let sequenced = Signal::new(signals.iter().map(|s| s.0.value.borrow().clone()).collect());
+    let initial_values: Vec<T> = signals.iter().map(|s| s.0.value.borrow().clone()).collect();
 
-    for signal in signals {
+    let sequenced = Signal::new(initial_values);
+
+    for signal in signals.iter() {
         let subscription = if use_weak {
-            let cap_sequenced = WeakRef::capture(&sequenced);
-            let cap_signals: Vec<_> = signals.iter().map(WeakRef::capture).collect();
+            let weak_sequenced = Rc::downgrade(&sequenced.0);
+            let weak_signals: Vec<_> = signals.iter().map(|s| Rc::downgrade(&s.0)).collect();
             Box::new(move || {
-                cap_sequenced
+                weak_sequenced
                     .upgrade()
-                    .map(|inner| {
-                        let values: Option<Vec<_>> =
-                            cap_signals.iter().map(WeakRef::try_get).collect();
-                        if let Some(v) = values {
-                            Signal(inner).send_now(v);
+                    .map(|sequenced_inner| {
+                        let sequenced = Signal(sequenced_inner);
+                        let new_values: Option<Vec<T>> = weak_signals
+                            .iter()
+                            .map(|weak| weak.upgrade().map(|inner| inner.value.borrow().clone()))
+                            .collect();
+
+                        if let Some(values) = new_values {
+                            sequenced.send_now(values);
                         }
                         true
                     })
                     .unwrap_or(false)
             }) as Box<dyn Fn() -> bool + 'a>
         } else {
-            let cap_sequenced = StrongRef::capture(&sequenced);
-            let cap_signals: Vec<_> = signals.iter().map(StrongRef::capture).collect();
+            let sequenced = sequenced.clone();
+            let signals_clone: Vec<_> = signals.iter().cloned().collect();
             Box::new(move || {
-                let values: Vec<_> = cap_signals.iter().filter_map(StrongRef::try_get).collect();
-                cap_sequenced.send_now(values);
+                let new_values: Vec<T> = signals_clone
+                    .iter()
+                    .map(|s| s.0.value.borrow().clone())
+                    .collect();
+                sequenced.send_now(new_values);
                 true
             }) as Box<dyn Fn() -> bool + 'a>
         };
