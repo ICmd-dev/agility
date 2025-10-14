@@ -47,8 +47,7 @@ mod tests {
         (signal_r, signal_l)
             .lift()
             .map(|(r, l)| println!("({}, {})", r, l));
-        println!("Sending 7...");
-        signal.send(7);
-        let _g = signal.send(10);
+        println!("Sending 7 and 8...");
+        (signal.send(7), signal.send(8));
     }
 }

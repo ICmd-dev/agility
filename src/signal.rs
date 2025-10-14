@@ -8,7 +8,7 @@ struct BatchState(Rc<RefCell<BatchStateInner>>);
 
 struct BatchStateInner {
     depth: usize,
-    notified_signals: Vec<*const ()>,
+    notification_depth: usize,
 }
 
 impl Clone for BatchState {
@@ -21,7 +21,7 @@ impl BatchState {
     fn new() -> Self {
         BatchState(Rc::new(RefCell::new(BatchStateInner {
             depth: 0,
-            notified_signals: Vec::new(),
+            notification_depth: 0,
         })))
     }
 
@@ -34,14 +34,27 @@ impl BatchState {
         state.depth = state.depth.saturating_sub(1);
 
         if state.depth == 0 {
-            state.notified_signals.clear();
             drop(state);
 
+            // Notify the primary signal that triggered the batch
             if *signal.needs_notification.borrow() {
                 *signal.needs_notification.borrow_mut() = false;
                 signal.notify_subscribers();
             }
         }
+    }
+
+    fn is_notifying(&self) -> bool {
+        self.0.borrow().notification_depth > 0
+    }
+
+    fn enter_notification(&self) {
+        self.0.borrow_mut().notification_depth += 1;
+    }
+
+    fn exit_notification(&self) {
+        let mut state = self.0.borrow_mut();
+        state.notification_depth = state.notification_depth.saturating_sub(1);
     }
 }
 
@@ -49,6 +62,7 @@ struct SignalInner<'a, T> {
     value: RefCell<T>,
     subscribers: RefCell<Vec<Box<dyn Fn() -> bool + 'a>>>,
     needs_notification: RefCell<bool>,
+    version: RefCell<u64>,
 }
 
 pub struct Signal<'a, T>(Rc<SignalInner<'a, T>>);
@@ -73,12 +87,14 @@ impl<'a, T> Signal<'a, T> {
             value: RefCell::new(initial_value),
             subscribers: RefCell::new(Vec::new()),
             needs_notification: RefCell::new(false),
+            version: RefCell::new(0),
         }))
     }
 
     pub fn send(&self, value: T) -> BatchGuard<'a, T> {
         GLOBAL_BATCH_STATE.with(|bs| bs.enter());
         *self.0.value.borrow_mut() = value;
+        *self.0.version.borrow_mut() += 1;
         *self.0.needs_notification.borrow_mut() = true;
 
         BatchGuard(self.clone())
@@ -90,6 +106,7 @@ impl<'a, T> Signal<'a, T> {
     {
         GLOBAL_BATCH_STATE.with(|bs| bs.enter());
         f(&mut self.0.value.borrow_mut());
+        *self.0.version.borrow_mut() += 1;
         *self.0.needs_notification.borrow_mut() = true;
 
         BatchGuard(self.clone())
@@ -97,6 +114,7 @@ impl<'a, T> Signal<'a, T> {
 
     pub fn send_now(&self, value: T) {
         *self.0.value.borrow_mut() = value;
+        *self.0.version.borrow_mut() += 1;
         self.0.notify_subscribers();
     }
 
@@ -105,7 +123,26 @@ impl<'a, T> Signal<'a, T> {
         F: FnOnce(&mut T),
     {
         f(&mut self.0.value.borrow_mut());
+        *self.0.version.borrow_mut() += 1;
         self.0.notify_subscribers();
+    }
+
+    fn send_deferred(&self, value: T) {
+        *self.0.value.borrow_mut() = value;
+        *self.0.version.borrow_mut() += 1;
+
+        GLOBAL_BATCH_STATE.with(|bs| {
+            if bs.is_notifying() {
+                let was_marked = *self.0.needs_notification.borrow();
+                *self.0.needs_notification.borrow_mut() = true;
+                if was_marked {
+                    *self.0.needs_notification.borrow_mut() = false;
+                    self.0.notify_subscribers();
+                }
+            } else {
+                self.0.notify_subscribers();
+            }
+        });
     }
     pub fn map<F, U>(&self, f: F) -> Signal<'a, U>
     where
@@ -188,8 +225,17 @@ impl<'a, T> Signal<'a, T> {
 
 impl<'a, T> SignalInner<'a, T> {
     fn notify_subscribers(&self) {
+        GLOBAL_BATCH_STATE.with(|bs| {
+            bs.enter_notification();
+        });
+
         let mut subscribers = self.subscribers.borrow_mut();
         subscribers.retain(|subscriber| subscriber());
+        drop(subscribers);
+
+        GLOBAL_BATCH_STATE.with(|bs| {
+            bs.exit_notification();
+        });
     }
 }
 
@@ -295,18 +341,31 @@ where
                 let weak_combined = Rc::downgrade(&combined.0);
                 let weak_signal = Rc::downgrade(&signal.0);
                 let weak_right = Rc::downgrade(&right.0);
+                let last_left_version = RefCell::new(0u64);
+                let last_right_version = RefCell::new(0u64);
                 Box::new(move || {
                     weak_combined
                         .upgrade()
                         .zip(weak_signal.upgrade())
                         .zip(weak_right.upgrade())
                         .map(|((combined_inner, signal_inner), right_inner)| {
-                            let combined = Signal(combined_inner);
-                            let new_value = (
-                                signal_inner.value.borrow().clone(),
-                                right_inner.value.borrow().clone(),
-                            );
-                            combined.send(new_value);
+                            let left_ver = *signal_inner.version.borrow();
+                            let right_ver = *right_inner.version.borrow();
+
+                            // Only update if versions changed
+                            if left_ver != *last_left_version.borrow()
+                                || right_ver != *last_right_version.borrow()
+                            {
+                                *last_left_version.borrow_mut() = left_ver;
+                                *last_right_version.borrow_mut() = right_ver;
+
+                                let combined = Signal(combined_inner.clone());
+                                let new_value = (
+                                    signal_inner.value.borrow().clone(),
+                                    right_inner.value.borrow().clone(),
+                                );
+                                combined.send_deferred(new_value);
+                            }
                             true
                         })
                         .unwrap_or(false)
@@ -315,12 +374,25 @@ where
                 let combined = combined.clone();
                 let signal = signal.clone();
                 let right = right.clone();
+                let last_left_version = RefCell::new(0u64);
+                let last_right_version = RefCell::new(0u64);
                 Box::new(move || {
-                    let new_value = (
-                        signal.0.value.borrow().clone(),
-                        right.0.value.borrow().clone(),
-                    );
-                    combined.send(new_value);
+                    let left_ver = *signal.0.version.borrow();
+                    let right_ver = *right.0.version.borrow();
+
+                    // Only update if versions changed
+                    if left_ver != *last_left_version.borrow()
+                        || right_ver != *last_right_version.borrow()
+                    {
+                        *last_left_version.borrow_mut() = left_ver;
+                        *last_right_version.borrow_mut() = right_ver;
+
+                        let new_value = (
+                            signal.0.value.borrow().clone(),
+                            right.0.value.borrow().clone(),
+                        );
+                        combined.send_deferred(new_value);
+                    }
                     true
                 }) as Box<dyn Fn() -> bool + 'a>
             }
@@ -362,7 +434,7 @@ where
                             .collect();
 
                         if let Some(values) = new_values {
-                            sequenced.send_now(values);
+                            sequenced.send_deferred(values);
                         }
                         true
                     })
@@ -376,7 +448,7 @@ where
                     .iter()
                     .map(|s| s.0.value.borrow().clone())
                     .collect();
-                sequenced.send_now(new_values);
+                sequenced.send_deferred(new_values);
                 true
             }) as Box<dyn Fn() -> bool + 'a>
         };
