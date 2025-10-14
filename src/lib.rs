@@ -1,4 +1,5 @@
 pub mod api;
+pub mod concurrent;
 pub mod signal;
 
 pub fn add(left: u64, right: u64) -> u64 {
@@ -9,7 +10,7 @@ pub fn add(left: u64, right: u64) -> u64 {
 mod tests {
     use std::{thread, time::Duration};
 
-    use crate::signal::{LiftInto, Signal};
+    use crate::{api::LiftInto, signal::Signal};
 
     #[test]
     fn it_works() {

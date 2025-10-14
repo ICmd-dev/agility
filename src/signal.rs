@@ -1,5 +1,7 @@
 use std::{cell::RefCell, rc::Rc};
 
+use crate::api::{LiftInto, WeakLiftInto};
+
 thread_local! {
     static GLOBAL_BATCH_STATE: BatchState = BatchState::new();
 }
@@ -67,17 +69,22 @@ struct SignalInner<'a, T> {
 
 pub struct Signal<'a, T>(Rc<SignalInner<'a, T>>);
 
-pub struct BatchGuard<'a, T>(Signal<'a, T>);
+pub struct BatchGuard<'s, 'a, T>(&'s Signal<'a, T>);
 
-impl<'a, T> Drop for BatchGuard<'a, T> {
+impl<T> Drop for BatchGuard<'_, '_, T> {
     fn drop(&mut self) {
         GLOBAL_BATCH_STATE.with(|bs| bs.exit(&self.0.0));
     }
 }
 
-impl<'a, T> Clone for Signal<'a, T> {
+impl<'a, T: Clone> Clone for Signal<'a, T> {
     fn clone(&self) -> Self {
-        Signal(Rc::clone(&self.0))
+        Signal(Rc::new(SignalInner {
+            value: RefCell::new(self.0.value.borrow().clone()),
+            subscribers: RefCell::new(Vec::new()),
+            needs_notification: RefCell::new(false),
+            version: RefCell::new(0),
+        }))
     }
 }
 
@@ -91,16 +98,16 @@ impl<'a, T> Signal<'a, T> {
         }))
     }
 
-    pub fn send(&self, value: T) -> BatchGuard<'a, T> {
+    pub fn send(&self, value: T) -> BatchGuard<'_, 'a, T> {
         GLOBAL_BATCH_STATE.with(|bs| bs.enter());
         *self.0.value.borrow_mut() = value;
         *self.0.version.borrow_mut() += 1;
         *self.0.needs_notification.borrow_mut() = true;
 
-        BatchGuard(self.clone())
+        BatchGuard(self)
     }
 
-    pub fn send_with<F>(&self, f: F) -> BatchGuard<'a, T>
+    pub fn send_with<F>(&self, f: F) -> BatchGuard<'_, 'a, T>
     where
         F: FnOnce(&mut T),
     {
@@ -109,7 +116,7 @@ impl<'a, T> Signal<'a, T> {
         *self.0.version.borrow_mut() += 1;
         *self.0.needs_notification.borrow_mut() = true;
 
-        BatchGuard(self.clone())
+        BatchGuard(self)
     }
 
     pub fn send_now(&self, value: T) {
@@ -152,8 +159,8 @@ impl<'a, T> Signal<'a, T> {
     {
         // Default map uses strong Rc references to keep signals alive.
         let new_signal = Signal::new(f(&self.0.value.borrow()));
-        let new_signal_clone = new_signal.clone();
-        let self_clone = self.clone();
+        let new_signal_clone = Signal(Rc::clone(&new_signal.0));
+        let self_clone = Signal(Rc::clone(&self.0));
         let subscription = Box::new(move || {
             let new_value = f(&self_clone.0.value.borrow());
             new_signal_clone.send_now(new_value);
@@ -237,14 +244,6 @@ impl<'a, T> SignalInner<'a, T> {
             bs.exit_notification();
         });
     }
-}
-
-pub trait LiftInto<T> {
-    fn lift(self) -> T;
-}
-
-pub trait WeakLiftInto<T> {
-    fn weak_lift(self) -> T;
 }
 
 impl<'a, T, U> LiftInto<Signal<'a, (T, U)>> for (Signal<'a, T>, Signal<'a, U>)
@@ -371,9 +370,9 @@ where
                         .unwrap_or(false)
                 }) as Box<dyn Fn() -> bool + 'a>
             } else {
-                let combined = combined.clone();
-                let signal = signal.clone();
-                let right = right.clone();
+                let combined = Signal(Rc::clone(&combined.0));
+                let signal = Signal(Rc::clone(&signal.0));
+                let right = Signal(Rc::clone(&right.0));
                 let last_left_version = RefCell::new(0u64);
                 let last_right_version = RefCell::new(0u64);
                 Box::new(move || {
@@ -441,7 +440,7 @@ where
                     .unwrap_or(false)
             }) as Box<dyn Fn() -> bool + 'a>
         } else {
-            let sequenced = sequenced.clone();
+            let sequenced = Signal(Rc::clone(&sequenced.0));
             let signals_clone: Vec<_> = signals.iter().cloned().collect();
             Box::new(move || {
                 let new_values: Vec<T> = signals_clone
