@@ -1,6 +1,13 @@
+[workspace]
+members = [".", "agility-macros"]
+
 [package]
 name = "agility"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+agility-macros = { path = "agility-macros" }
+
+[dev-dependencies]
+trybuild = "1.0"

@@ -60,14 +60,14 @@ impl BatchState {
     }
 }
 
-struct SignalInner<'a, T> {
-    value: RefCell<T>,
-    subscribers: RefCell<Vec<Box<dyn Fn() -> bool + 'a>>>,
-    needs_notification: RefCell<bool>,
-    version: RefCell<u64>,
+pub struct SignalInner<'a, T> {
+    pub value: RefCell<T>,
+    pub subscribers: RefCell<Vec<Box<dyn Fn() -> bool + 'a>>>,
+    pub needs_notification: RefCell<bool>,
+    pub version: RefCell<u64>,
 }
 
-pub struct Signal<'a, T>(Rc<SignalInner<'a, T>>);
+pub struct Signal<'a, T>(pub Rc<SignalInner<'a, T>>);
 
 pub struct BatchGuard<'s, 'a, T>(&'s Signal<'a, T>);
 
@@ -134,8 +134,11 @@ impl<'a, T> Signal<'a, T> {
         self.0.notify_subscribers();
     }
 
-    fn send_deferred(&self, value: T) {
-        *self.0.value.borrow_mut() = value;
+    fn send_deferred_with<F>(&self, f: F)
+    where
+        F: FnOnce(&mut T),
+    {
+        f(&mut self.0.value.borrow_mut());
         *self.0.version.borrow_mut() += 1;
 
         GLOBAL_BATCH_STATE.with(|bs| {
@@ -150,6 +153,14 @@ impl<'a, T> Signal<'a, T> {
                 self.0.notify_subscribers();
             }
         });
+    }
+
+    #[doc(hidden)]
+    pub fn __send_deferred_with<F>(&self, f: F)
+    where
+        F: FnOnce(&mut T),
+    {
+        self.send_deferred_with(f);
     }
     pub fn map<F, U>(&self, f: F) -> Signal<'a, U>
     where
@@ -333,72 +344,51 @@ where
     U: Clone + 'a,
     T: Clone + 'a,
 {
+    use crate::api::RcRef;
+
     let new_combined = Signal::new((
         left.0.value.borrow().clone(),
         right.0.value.borrow().clone(),
     ));
 
     let create_subscription =
-        |signal: &Signal<'a, T>, right: &Signal<'a, U>, combined: &Signal<'a, (T, U)>| {
-            if use_weak {
-                let weak_combined = Rc::downgrade(&combined.0);
-                let weak_signal = Rc::downgrade(&signal.0);
-                let weak_right = Rc::downgrade(&right.0);
-                let last_left_version = RefCell::new(0u64);
-                let last_right_version = RefCell::new(0u64);
-                Box::new(move || {
-                    weak_combined
-                        .upgrade()
-                        .zip(weak_signal.upgrade())
-                        .zip(weak_right.upgrade())
-                        .map(|((combined_inner, signal_inner), right_inner)| {
-                            let left_ver = *signal_inner.version.borrow();
-                            let right_ver = *right_inner.version.borrow();
+        |left: &Signal<'a, T>, right: &Signal<'a, U>, combined: &Signal<'a, (T, U)>| {
+            let ref_combined = RcRef::new(Rc::clone(&combined.0), use_weak);
+            let ref_left = RcRef::new(Rc::clone(&left.0), use_weak);
+            let ref_right = RcRef::new(Rc::clone(&right.0), use_weak);
 
-                            // Only update if versions changed
-                            if left_ver != *last_left_version.borrow()
-                                || right_ver != *last_right_version.borrow()
-                            {
-                                *last_left_version.borrow_mut() = left_ver;
-                                *last_right_version.borrow_mut() = right_ver;
+            let last_left_version = RefCell::new(0u64);
+            let last_right_version = RefCell::new(0u64);
 
-                                let combined = Signal(combined_inner.clone());
-                                let new_value = (
-                                    signal_inner.value.borrow().clone(),
-                                    right_inner.value.borrow().clone(),
-                                );
-                                combined.send_deferred(new_value);
-                            }
-                            true
-                        })
-                        .unwrap_or(false)
-                }) as Box<dyn Fn() -> bool + 'a>
-            } else {
-                let combined = Signal(Rc::clone(&combined.0));
-                let signal = Signal(Rc::clone(&signal.0));
-                let right = Signal(Rc::clone(&right.0));
-                let last_left_version = RefCell::new(0u64);
-                let last_right_version = RefCell::new(0u64);
-                Box::new(move || {
-                    let left_ver = *signal.0.version.borrow();
-                    let right_ver = *right.0.version.borrow();
+            Box::new(move || {
+                ref_combined
+                    .upgrade()
+                    .zip(ref_left.upgrade())
+                    .zip(ref_right.upgrade())
+                    .map(|((combined_inner, left_inner), right_inner)| {
+                        let left_ver = *left_inner.version.borrow();
+                        let right_ver = *right_inner.version.borrow();
+                        let left_changed = left_ver != *last_left_version.borrow();
+                        let right_changed = right_ver != *last_right_version.borrow();
 
-                    // Only update if versions changed
-                    if left_ver != *last_left_version.borrow()
-                        || right_ver != *last_right_version.borrow()
-                    {
-                        *last_left_version.borrow_mut() = left_ver;
-                        *last_right_version.borrow_mut() = right_ver;
+                        if left_changed || right_changed {
+                            *last_left_version.borrow_mut() = left_ver;
+                            *last_right_version.borrow_mut() = right_ver;
 
-                        let new_value = (
-                            signal.0.value.borrow().clone(),
-                            right.0.value.borrow().clone(),
-                        );
-                        combined.send_deferred(new_value);
-                    }
-                    true
-                }) as Box<dyn Fn() -> bool + 'a>
-            }
+                            let combined = Signal(combined_inner);
+                            combined.send_deferred_with(|tuple| {
+                                if left_changed {
+                                    tuple.0 = left_inner.value.borrow().clone();
+                                }
+                                if right_changed {
+                                    tuple.1 = right_inner.value.borrow().clone();
+                                }
+                            });
+                        }
+                        true
+                    })
+                    .unwrap_or(false)
+            }) as Box<dyn Fn() -> bool + 'a>
         };
 
     left.0
@@ -418,61 +408,56 @@ fn sequence_impl<'a, T>(signals: &[Signal<'a, T>], use_weak: bool) -> Signal<'a,
 where
     T: Clone + 'a,
 {
+    use crate::api::RcRef;
+
     let initial_values: Vec<T> = signals.iter().map(|s| s.0.value.borrow().clone()).collect();
     let new_sequence = Signal::new(initial_values);
 
     let create_subscription = |signals: &[Signal<'a, T>], sequence: &Signal<'a, Vec<T>>| {
-        if use_weak {
-            let weak_sequence = Rc::downgrade(&sequence.0);
-            let weak_signals: Vec<_> = signals.iter().map(|s| Rc::downgrade(&s.0)).collect();
-            let last_versions = RefCell::new(vec![0u64; signals.len()]);
+        let ref_sequence = RcRef::new(Rc::clone(&sequence.0), use_weak);
+        let ref_signals: Vec<_> = signals
+            .iter()
+            .map(|s| RcRef::new(Rc::clone(&s.0), use_weak))
+            .collect();
 
-            Box::new(move || {
-                weak_sequence
-                    .upgrade()
-                    .and_then(|sequence_inner| {
-                        let upgraded: Option<Vec<_>> =
-                            weak_signals.iter().map(|ws| ws.upgrade()).collect();
+        let last_versions = RefCell::new(vec![0u64; signals.len()]);
 
-                        upgraded.map(|signal_inners| {
-                            let versions: Vec<u64> = signal_inners
-                                .iter()
-                                .map(|si| *si.version.borrow())
-                                .collect();
+        Box::new(move || {
+            ref_sequence
+                .upgrade()
+                .and_then(|sequence_inner| {
+                    let upgraded: Option<Vec<_>> =
+                        ref_signals.iter().map(|rs| rs.upgrade()).collect();
 
-                            if versions != *last_versions.borrow() {
-                                *last_versions.borrow_mut() = versions;
+                    upgraded.map(|signal_inners| {
+                        let versions: Vec<u64> = signal_inners
+                            .iter()
+                            .map(|si| *si.version.borrow())
+                            .collect();
 
-                                let sequence = Signal(sequence_inner);
-                                let new_values: Vec<T> = signal_inners
-                                    .iter()
-                                    .map(|si| si.value.borrow().clone())
-                                    .collect();
-                                sequence.send_deferred(new_values);
-                            }
-                            true
-                        })
+                        let last = last_versions.borrow();
+                        let changed_indices: Vec<_> = versions
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, &v)| (v != last[i]).then_some(i))
+                            .collect();
+
+                        if !changed_indices.is_empty() {
+                            drop(last);
+                            *last_versions.borrow_mut() = versions;
+
+                            let sequence = Signal(sequence_inner);
+                            sequence.send_deferred_with(|vec| {
+                                for &i in &changed_indices {
+                                    vec[i] = signal_inners[i].value.borrow().clone();
+                                }
+                            });
+                        }
+                        true
                     })
-                    .unwrap_or(false)
-            }) as Box<dyn Fn() -> bool + 'a>
-        } else {
-            let sequence = Signal(Rc::clone(&sequence.0));
-            let signals: Vec<_> = signals.iter().map(|s| Signal(Rc::clone(&s.0))).collect();
-            let last_versions = RefCell::new(vec![0u64; signals.len()]);
-
-            Box::new(move || {
-                let versions: Vec<u64> = signals.iter().map(|s| *s.0.version.borrow()).collect();
-
-                if versions != *last_versions.borrow() {
-                    *last_versions.borrow_mut() = versions;
-
-                    let new_values: Vec<T> =
-                        signals.iter().map(|s| s.0.value.borrow().clone()).collect();
-                    sequence.send_deferred(new_values);
-                }
-                true
-            }) as Box<dyn Fn() -> bool + 'a>
-        }
+                })
+                .unwrap_or(false)
+        }) as Box<dyn Fn() -> bool + 'a>
     };
 
     for signal in signals {
