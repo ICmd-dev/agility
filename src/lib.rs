@@ -49,4 +49,24 @@ mod tests {
         println!("Sending 7 and 8...");
         (signal.send(7), signal.send(8));
     }
+
+    #[test]
+    fn sequence() {
+        let entrance = Signal::new(5);
+        let a = entrance.map(|x| {
+            let new = x + 1;
+            println!("a: {}", new);
+            new
+        });
+        let b = a.map(|x| {
+            let new = x * 2;
+            println!("b: {}", new);
+            new
+        });
+        let c = [a, b].lift();
+        c.map(|s| s.iter().map(|x| *x).collect::<Vec<_>>())
+            .map(|v| println!("c: {:?}", v));
+        println!("Sending 7 and 8...");
+        (entrance.send(7), entrance.send(8));
+    }
 }

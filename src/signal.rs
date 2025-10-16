@@ -228,6 +228,10 @@ impl<'a, T> Signal<'a, T> {
     {
         sequence_impl(signals, true)
     }
+
+    pub fn clone_refered(&self) -> Signal<'a, T> {
+        Signal(Rc::clone(&self.0))
+    }
 }
 
 impl<'a, T> SignalInner<'a, T> {
@@ -415,45 +419,69 @@ where
     T: Clone + 'a,
 {
     let initial_values: Vec<T> = signals.iter().map(|s| s.0.value.borrow().clone()).collect();
+    let new_sequence = Signal::new(initial_values);
 
-    let sequenced = Signal::new(initial_values);
-
-    for signal in signals.iter() {
-        let subscription = if use_weak {
-            let weak_sequenced = Rc::downgrade(&sequenced.0);
+    let create_subscription = |signals: &[Signal<'a, T>], sequence: &Signal<'a, Vec<T>>| {
+        if use_weak {
+            let weak_sequence = Rc::downgrade(&sequence.0);
             let weak_signals: Vec<_> = signals.iter().map(|s| Rc::downgrade(&s.0)).collect();
-            Box::new(move || {
-                weak_sequenced
-                    .upgrade()
-                    .map(|sequenced_inner| {
-                        let sequenced = Signal(sequenced_inner);
-                        let new_values: Option<Vec<T>> = weak_signals
-                            .iter()
-                            .map(|weak| weak.upgrade().map(|inner| inner.value.borrow().clone()))
-                            .collect();
+            let last_versions = RefCell::new(vec![0u64; signals.len()]);
 
-                        if let Some(values) = new_values {
-                            sequenced.send_deferred(values);
-                        }
-                        true
+            Box::new(move || {
+                weak_sequence
+                    .upgrade()
+                    .and_then(|sequence_inner| {
+                        let upgraded: Option<Vec<_>> =
+                            weak_signals.iter().map(|ws| ws.upgrade()).collect();
+
+                        upgraded.map(|signal_inners| {
+                            let versions: Vec<u64> = signal_inners
+                                .iter()
+                                .map(|si| *si.version.borrow())
+                                .collect();
+
+                            if versions != *last_versions.borrow() {
+                                *last_versions.borrow_mut() = versions;
+
+                                let sequence = Signal(sequence_inner);
+                                let new_values: Vec<T> = signal_inners
+                                    .iter()
+                                    .map(|si| si.value.borrow().clone())
+                                    .collect();
+                                sequence.send_deferred(new_values);
+                            }
+                            true
+                        })
                     })
                     .unwrap_or(false)
             }) as Box<dyn Fn() -> bool + 'a>
         } else {
-            let sequenced = Signal(Rc::clone(&sequenced.0));
-            let signals_clone: Vec<_> = signals.iter().cloned().collect();
+            let sequence = Signal(Rc::clone(&sequence.0));
+            let signals: Vec<_> = signals.iter().map(|s| Signal(Rc::clone(&s.0))).collect();
+            let last_versions = RefCell::new(vec![0u64; signals.len()]);
+
             Box::new(move || {
-                let new_values: Vec<T> = signals_clone
-                    .iter()
-                    .map(|s| s.0.value.borrow().clone())
-                    .collect();
-                sequenced.send_deferred(new_values);
+                let versions: Vec<u64> = signals.iter().map(|s| *s.0.version.borrow()).collect();
+
+                if versions != *last_versions.borrow() {
+                    *last_versions.borrow_mut() = versions;
+
+                    let new_values: Vec<T> =
+                        signals.iter().map(|s| s.0.value.borrow().clone()).collect();
+                    sequence.send_deferred(new_values);
+                }
                 true
             }) as Box<dyn Fn() -> bool + 'a>
-        };
+        }
+    };
 
-        signal.0.subscribers.borrow_mut().push(subscription);
+    for signal in signals {
+        signal
+            .0
+            .subscribers
+            .borrow_mut()
+            .push(create_subscription(signals, &new_sequence));
     }
 
-    sequenced
+    new_sequence
 }
