@@ -5,16 +5,17 @@ use quote::{format_ident, quote};
 use syn::{Ident, ItemStruct, parse_macro_input};
 
 #[proc_macro_attribute]
-pub fn lift_struct(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn lift(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemStruct);
     let name = &input.ident;
     let vis = &input.vis;
     let generics = &input.generics;
+    let attrs = &input.attrs;
 
     let fields = if let syn::Fields::Named(fields_named) = &input.fields {
         &fields_named.named
     } else {
-        panic!("lift_struct can only be applied to structs with named fields");
+        panic!("lift can only be applied to structs with named fields");
     };
 
     let mut signal_fields = Vec::new();
@@ -67,6 +68,7 @@ pub fn lift_struct(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(pub #non_signal_field_names: #non_signal_field_types,)*
         }
 
+        #(#attrs)*
         #[derive(Clone)]
         #vis struct #lifted_name #generics #where_clause {
             #(pub #signal_field_names: #signal_field_types,)*
@@ -171,11 +173,4 @@ pub fn lift_struct(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
-}
-
-#[proc_macro_derive(Lift, attributes(signal))]
-pub fn derive_lift(_input: TokenStream) -> TokenStream {
-    TokenStream::from(quote! {
-        compile_error!("Use #[lift_struct] attribute macro instead of #[derive(Lift)]");
-    })
 }
