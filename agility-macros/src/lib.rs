@@ -2,172 +2,167 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Ident, ItemStruct, parse_macro_input};
+use syn::{DeriveInput, Fields, GenericArgument, PathArguments, Type, TypePath, parse_macro_input};
 
-#[proc_macro_attribute]
-pub fn lift(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(item as ItemStruct);
+/// Helper function to check if a type is Signal<'a, T> and extract the inner type T
+fn extract_signal_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(TypePath { path, .. }) = ty {
+        // Get the last segment of the path (e.g., "Signal" from "crate::signal::Signal")
+        let last_segment = path.segments.last()?;
+
+        // Check if it's named "Signal"
+        if last_segment.ident != "Signal" {
+            return None;
+        }
+
+        // Extract the generic arguments
+        if let PathArguments::AngleBracketed(args) = &last_segment.arguments {
+            // Signal<'a, T> has two generic arguments: lifetime 'a and type T
+            // We want to extract T (the second argument)
+            let mut iter = args.args.iter();
+            iter.next()?; // Skip the lifetime
+
+            if let Some(GenericArgument::Type(inner_ty)) = iter.next() {
+                return Some(inner_ty);
+            }
+        }
+    }
+    None
+}
+
+#[proc_macro_derive(Lift)]
+pub fn derive_lift(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
-    let vis = &input.vis;
     let generics = &input.generics;
-    let attrs = &input.attrs;
+    let vis = &input.vis;
 
-    let fields = if let syn::Fields::Named(fields_named) = &input.fields {
-        &fields_named.named
-    } else {
-        panic!("lift can only be applied to structs with named fields");
+    // Get the fields
+    let fields = match &input.data {
+        syn::Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => &fields.named,
+            _ => panic!("Lift only supports structs with named fields"),
+        },
+        _ => panic!("Lift can only be derived for structs"),
     };
 
+    // Separate signal fields from regular fields by checking the type
     let mut signal_fields = Vec::new();
-    let mut non_signal_fields = Vec::new();
+    let mut regular_fields = Vec::new();
 
-    for field in fields.iter() {
-        let has_signal_attr = field
-            .attrs
-            .iter()
-            .any(|attr| attr.path().is_ident("signal"));
-        if has_signal_attr {
+    for field in fields {
+        if extract_signal_inner_type(&field.ty).is_some() {
             signal_fields.push(field);
         } else {
-            non_signal_fields.push(field);
+            regular_fields.push(field);
         }
     }
 
-    let lifted_name = Ident::new(&format!("{}_", name), name.span());
+    // Generate the inner struct name (prefixed with underscore)
+    let inner_name = format_ident!("_{}", name);
 
-    let signal_field_names: Vec<_> = signal_fields.iter().map(|f| &f.ident).collect();
-    let signal_field_types: Vec<_> = signal_fields.iter().map(|f| &f.ty).collect();
-    let non_signal_field_names: Vec<_> = non_signal_fields.iter().map(|f| &f.ident).collect();
-    let non_signal_field_types: Vec<_> = non_signal_fields.iter().map(|f| &f.ty).collect();
+    // Generate fields for the inner struct (unwrapped types)
+    let inner_struct_fields = fields.iter().map(|field| {
+        let field_name = &field.ident;
+        let field_vis = &field.vis;
 
-    let signal_ref_names: Vec<_> = signal_field_names
-        .iter()
-        .map(|name| format_ident!("ref_{}", name.as_ref().unwrap()))
-        .collect();
+        // If it's a Signal<'a, T>, use T; otherwise use the original type
+        let field_ty = if let Some(inner_ty) = extract_signal_inner_type(&field.ty) {
+            inner_ty
+        } else {
+            &field.ty
+        };
 
-    let signal_ver_names: Vec<_> = signal_field_names
-        .iter()
-        .map(|name| format_ident!("{}_ver", name.as_ref().unwrap()))
-        .collect();
-
-    let signal_changed_names: Vec<_> = signal_field_names
-        .iter()
-        .map(|name| format_ident!("{}_changed", name.as_ref().unwrap()))
-        .collect();
-
-    let signal_last_ver_names: Vec<_> = signal_field_names
-        .iter()
-        .map(|name| format_ident!("last_{}_ver", name.as_ref().unwrap()))
-        .collect();
-
-    let (_impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
-
-    let expanded = quote! {
-        #vis struct #name<'a> {
-            #(pub #signal_field_names: crate::signal::Signal<'a, #signal_field_types>,)*
-            #(pub #non_signal_field_names: #non_signal_field_types,)*
+        quote! {
+            #field_vis #field_name: #field_ty
         }
+    });
 
-        #(#attrs)*
-        #[derive(Clone)]
-        #vis struct #lifted_name #generics #where_clause {
-            #(pub #signal_field_names: #signal_field_types,)*
-            #(pub #non_signal_field_names: #non_signal_field_types,)*
-        }
+    // Generate the reactive setup code for signal fields
+    let reactive_setup = signal_fields.iter().map(|field| {
+        let field_name = &field.ident;
 
-        impl<'a> crate::api::LiftInto<crate::signal::Signal<'a, #lifted_name>> for #name<'a>
-        where
-            #(#signal_field_types: Clone + 'a,)*
-        {
-            fn lift(self) -> crate::signal::Signal<'a, #lifted_name> {
-                use std::cell::RefCell;
-                use std::rc::Rc;
-                use crate::api::RcRef;
-
-                let initial = #lifted_name {
-                    #(#signal_field_names: self.#signal_field_names.0.value.borrow().clone(),)*
-                    #(#non_signal_field_names: self.#non_signal_field_names,)*
-                };
-
-                let new_struct = crate::signal::Signal::new(initial);
-
-                #(
-                    {
-                        let ref_result = RcRef::new(Rc::clone(&new_struct.0), false);
-                        let #signal_ref_names = RcRef::new(Rc::clone(&self.#signal_field_names.0), false);
-                        let #signal_last_ver_names = RefCell::new(0u64);
-
-                        self.#signal_field_names.0.subscribers.borrow_mut().push(Box::new(move || {
-                            ref_result.upgrade()
-                                .zip(#signal_ref_names.upgrade())
-                                .map(|(result_inner, signal_inner)| {
-                                    let #signal_ver_names = *signal_inner.version.borrow();
-                                    let #signal_changed_names = #signal_ver_names != *#signal_last_ver_names.borrow();
-
-                                    if #signal_changed_names {
-                                        *#signal_last_ver_names.borrow_mut() = #signal_ver_names;
-
-                                        let result = crate::signal::Signal(result_inner);
-                                        result.__send_deferred_with(|s| {
-                                            s.#signal_field_names = signal_inner.value.borrow().clone();
-                                        });
-                                    }
-                                    true
-                                })
-                                .unwrap_or(false)
-                        }) as Box<dyn Fn() -> bool + 'a>);
+        quote! {
+            {
+                let result_signal_clone = result_signal.clone();
+                let source_for_closure = std::rc::Rc::clone(&instance.#field_name.0);
+                let react_fn = Box::new(move || {
+                    if !*result_signal_clone.0.explicitly_modified.borrow() {
+                        result_signal_clone.modify(|v| {
+                            v.#field_name = source_for_closure.value.borrow().clone();
+                        });
                     }
-                )*
-
-                new_struct
+                });
+                let cloned_signal = instance.#field_name.clone();
+                cloned_signal.0.react_fns.borrow_mut().push(react_fn);
+                cloned_signal.0.successors.borrow_mut().push(Box::new(result_signal.clone()));
             }
         }
+    });
 
-        impl<'a> crate::api::WeakLiftInto<crate::signal::Signal<'a, #lifted_name>> for #name<'a>
-        where
-            #(#signal_field_types: Clone + 'a,)*
-        {
-            fn weak_lift(self) -> crate::signal::Signal<'a, #lifted_name> {
-                use std::cell::RefCell;
-                use std::rc::Rc;
-                use crate::api::RcRef;
+    // Generate the inner struct initialization from main struct
+    let inner_from_main = signal_fields.iter().map(|field| {
+        let field_name = &field.ident;
+        quote! {
+            #field_name: instance.#field_name.0.value.borrow().clone()
+        }
+    });
 
-                let initial = #lifted_name {
-                    #(#signal_field_names: self.#signal_field_names.0.value.borrow().clone(),)*
-                    #(#non_signal_field_names: self.#non_signal_field_names,)*
+    let regular_from_main = regular_fields.iter().map(|field| {
+        let field_name = &field.ident;
+        quote! {
+            #field_name: instance.#field_name.clone()
+        }
+    });
+
+    // Generate Clone trait bounds for signal fields (using the unwrapped inner type)
+    let signal_clone_bounds = signal_fields.iter().filter_map(|field| {
+        extract_signal_inner_type(&field.ty).map(|inner_ty| {
+            quote! { #inner_ty: Clone }
+        })
+    });
+
+    // Generate Clone trait bounds for regular fields
+    let regular_clone_bounds = regular_fields.iter().map(|field| {
+        let field_ty = &field.ty;
+        quote! { #field_ty: Clone }
+    });
+
+    // Extract generics for impl block
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    // Create a version of generics without lifetimes for the inner struct
+    let type_params = generics.type_params().map(|tp| &tp.ident);
+    let inner_ty_generics = if generics.type_params().count() > 0 {
+        quote! { <#(#type_params),*> }
+    } else {
+        quote! {}
+    };
+
+    let expanded = quote! {
+        // Inner struct (unwrapped types)
+        #[derive(Clone)]
+        #vis struct #inner_name #inner_ty_generics {
+            #(#inner_struct_fields),*
+        }
+
+        impl #impl_generics #name #ty_generics #where_clause {
+            pub fn lift(self) -> crate::signal::Signal<'a, #inner_name #inner_ty_generics>
+            where
+                #(#signal_clone_bounds,)*
+                #(#regular_clone_bounds,)*
+            {
+                let instance = self;
+                let initial_inner = #inner_name {
+                    #(#inner_from_main,)*
+                    #(#regular_from_main),*
                 };
 
-                let new_struct = crate::signal::Signal::new(initial);
+                let result_signal = crate::signal::Signal::new(initial_inner);
 
-                #(
-                    {
-                        let ref_result = RcRef::new(Rc::clone(&new_struct.0), true);
-                        let #signal_ref_names = RcRef::new(Rc::clone(&self.#signal_field_names.0), true);
-                        let #signal_last_ver_names = RefCell::new(0u64);
+                #(#reactive_setup)*
 
-                        self.#signal_field_names.0.subscribers.borrow_mut().push(Box::new(move || {
-                            ref_result.upgrade()
-                                .zip(#signal_ref_names.upgrade())
-                                .map(|(result_inner, signal_inner)| {
-                                    let #signal_ver_names = *signal_inner.version.borrow();
-                                    let #signal_changed_names = #signal_ver_names != *#signal_last_ver_names.borrow();
-
-                                    if #signal_changed_names {
-                                        *#signal_last_ver_names.borrow_mut() = #signal_ver_names;
-
-                                        let result = crate::signal::Signal(result_inner);
-                                        result.__send_deferred_with(|s| {
-                                            s.#signal_field_names = signal_inner.value.borrow().clone();
-                                        });
-                                    }
-                                    true
-                                })
-                                .unwrap_or(false)
-                        }) as Box<dyn Fn() -> bool + 'a>);
-                    }
-                )*
-
-                new_struct
+                result_signal
             }
         }
     };

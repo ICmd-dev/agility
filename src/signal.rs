@@ -1,472 +1,307 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, iter, rc::Rc};
 
-use crate::api::{LiftInto, WeakLiftInto};
+use crate::api::Liftable;
 
-thread_local! {
-    static GLOBAL_BATCH_STATE: BatchState = BatchState::new();
+pub(crate) trait SignalExt<'a> {
+    fn react(&self);
+    fn guard(&self) -> SignalGuard<'a>;
+    fn decrease_dirty(&self);
+    fn get_dirty(&self) -> isize;
+    fn clone_box(&self) -> Box<dyn SignalExt<'a> + 'a>;
+    fn collect_guards_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>);
+    fn reset_explicitly_modified(&self);
 }
 
-struct BatchState(Rc<RefCell<BatchStateInner>>);
+pub(crate) struct SignalGuardInner<'a>(Box<dyn SignalExt<'a> + 'a>);
 
-struct BatchStateInner {
-    depth: usize,
-    notification_depth: usize,
-}
+#[allow(dead_code)]
+#[allow(unused_must_use)]
+pub struct SignalGuard<'a>(Vec<SignalGuardInner<'a>>);
 
-impl Clone for BatchState {
-    fn clone(&self) -> Self {
-        BatchState(Rc::clone(&self.0))
-    }
-}
-
-impl BatchState {
-    fn new() -> Self {
-        BatchState(Rc::new(RefCell::new(BatchStateInner {
-            depth: 0,
-            notification_depth: 0,
-        })))
-    }
-
-    fn enter(&self) {
-        self.0.borrow_mut().depth += 1;
-    }
-
-    fn exit<T>(&self, signal: &SignalInner<T>) {
-        let mut state = self.0.borrow_mut();
-        state.depth = state.depth.saturating_sub(1);
-
-        if state.depth == 0 {
-            drop(state);
-
-            // Notify the primary signal that triggered the batch
-            if *signal.needs_notification.borrow() {
-                *signal.needs_notification.borrow_mut() = false;
-                signal.notify_subscribers();
-            }
+impl<'a> Drop for SignalGuardInner<'a> {
+    fn drop(&mut self) {
+        self.0.decrease_dirty();
+        if self.0.get_dirty() == 0 {
+            self.0.react();
+            self.0.reset_explicitly_modified();
         }
-    }
-
-    fn is_notifying(&self) -> bool {
-        self.0.borrow().notification_depth > 0
-    }
-
-    fn enter_notification(&self) {
-        self.0.borrow_mut().notification_depth += 1;
-    }
-
-    fn exit_notification(&self) {
-        let mut state = self.0.borrow_mut();
-        state.notification_depth = state.notification_depth.saturating_sub(1);
     }
 }
 
 pub struct SignalInner<'a, T> {
-    pub value: RefCell<T>,
-    pub subscribers: RefCell<Vec<Box<dyn Fn() -> bool + 'a>>>,
-    pub needs_notification: RefCell<bool>,
-    pub version: RefCell<u64>,
+    pub(crate) value: RefCell<T>,
+    pub(crate) react_fns: RefCell<Vec<Box<dyn Fn() + 'a>>>,
+    pub(crate) successors: RefCell<Vec<Box<dyn SignalExt<'a> + 'a>>>,
+    pub(crate) dirty: RefCell<isize>,
+    pub(crate) explicitly_modified: RefCell<bool>,
 }
 
-pub struct Signal<'a, T>(pub Rc<SignalInner<'a, T>>);
+pub struct Signal<'a, T>(pub(crate) Rc<SignalInner<'a, T>>);
 
-pub struct BatchGuard<'s, 'a, T>(&'s Signal<'a, T>);
-
-impl<T> Drop for BatchGuard<'_, '_, T> {
-    fn drop(&mut self) {
-        GLOBAL_BATCH_STATE.with(|bs| bs.exit(&self.0.0));
-    }
-}
-
-impl<'a, T: Clone> Clone for Signal<'a, T> {
-    fn clone(&self) -> Self {
-        Signal(Rc::new(SignalInner {
-            value: RefCell::new(self.0.value.borrow().clone()),
-            subscribers: RefCell::new(Vec::new()),
-            needs_notification: RefCell::new(false),
-            version: RefCell::new(0),
-        }))
-    }
-}
-
-impl<'a, T> Signal<'a, T> {
-    pub fn new(initial_value: T) -> Signal<'a, T> {
-        Signal(Rc::new(SignalInner {
-            value: RefCell::new(initial_value),
-            subscribers: RefCell::new(Vec::new()),
-            needs_notification: RefCell::new(false),
-            version: RefCell::new(0),
-        }))
+impl<'a, T: 'a> Signal<'a, T> {
+    pub fn new(initial: T) -> Self {
+        let inner = Rc::new(SignalInner {
+            value: RefCell::new(initial),
+            react_fns: RefCell::new(Vec::new()),
+            successors: RefCell::new(Vec::new()),
+            dirty: RefCell::new(0),
+            explicitly_modified: RefCell::new(false),
+        });
+        Signal(inner)
     }
 
-    pub fn send(&self, value: T) -> BatchGuard<'_, 'a, T> {
-        GLOBAL_BATCH_STATE.with(|bs| bs.enter());
-        *self.0.value.borrow_mut() = value;
-        *self.0.version.borrow_mut() += 1;
-        *self.0.needs_notification.borrow_mut() = true;
-
-        BatchGuard(self)
+    pub fn send(&self, new_value: T) -> SignalGuard<'a> {
+        self.modify(|v| *v = new_value);
+        *self.0.explicitly_modified.borrow_mut() = true;
+        self.guard()
     }
 
-    pub fn send_with<F>(&self, f: F) -> BatchGuard<'_, 'a, T>
+    pub fn send_with<F>(&self, f: F) -> SignalGuard<'a>
     where
         F: FnOnce(&mut T),
     {
-        GLOBAL_BATCH_STATE.with(|bs| bs.enter());
-        f(&mut self.0.value.borrow_mut());
-        *self.0.version.borrow_mut() += 1;
-        *self.0.needs_notification.borrow_mut() = true;
-
-        BatchGuard(self)
+        self.modify(f);
+        self.guard()
     }
 
-    pub fn send_now(&self, value: T) {
-        *self.0.value.borrow_mut() = value;
-        *self.0.version.borrow_mut() += 1;
-        self.0.notify_subscribers();
-    }
-
-    pub fn send_with_now<F>(&self, f: F)
+    pub fn map<U: 'a, F>(&self, f: F) -> Signal<'a, U>
     where
-        F: FnOnce(&mut T),
+        F: Fn(&T) -> U + 'a,
     {
-        f(&mut self.0.value.borrow_mut());
-        *self.0.version.borrow_mut() += 1;
-        self.0.notify_subscribers();
-    }
+        let new_signal = Signal::new(f(&self.0.value.borrow()));
+        let cloned_new_signal = Box::new(new_signal.clone());
+        let result_new_signal = new_signal.clone();
+        let source_for_closure = Rc::clone(&self.0);
 
-    fn send_deferred_with<F>(&self, f: F)
-    where
-        F: FnOnce(&mut T),
-    {
-        f(&mut self.0.value.borrow_mut());
-        *self.0.version.borrow_mut() += 1;
-
-        GLOBAL_BATCH_STATE.with(|bs| {
-            if bs.is_notifying() {
-                let was_marked = *self.0.needs_notification.borrow();
-                *self.0.needs_notification.borrow_mut() = true;
-                if was_marked {
-                    *self.0.needs_notification.borrow_mut() = false;
-                    self.0.notify_subscribers();
-                }
-            } else {
-                self.0.notify_subscribers();
+        let react_fn = Box::new(move || {
+            // Only update if the signal wasn't explicitly modified
+            if !*new_signal.0.explicitly_modified.borrow() {
+                let new_value = f(&source_for_closure.value.borrow());
+                new_signal.modify(|v| *v = new_value);
             }
         });
+
+        self.0.react_fns.borrow_mut().push(react_fn);
+        self.0.successors.borrow_mut().push(cloned_new_signal);
+        result_new_signal
     }
 
-    #[doc(hidden)]
-    pub fn __send_deferred_with<F>(&self, f: F)
+    pub fn with<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
     where
-        F: FnOnce(&mut T),
+        S: Liftable<'a>,
+        S::Inner: Clone + 'a,
+        T: Clone,
     {
-        self.send_deferred_with(f);
-    }
-    pub fn map<F, U>(&self, f: F) -> Signal<'a, U>
-    where
-        F: Fn(&T) -> U + 'a,
-        U: 'a,
-        T: 'a,
-    {
-        // Default map uses strong Rc references to keep signals alive.
-        let new_signal = Signal::new(f(&self.0.value.borrow()));
-        let new_signal_clone = Signal(Rc::clone(&new_signal.0));
-        let self_clone = Signal(Rc::clone(&self.0));
-        let subscription = Box::new(move || {
-            let new_value = f(&self_clone.0.value.borrow());
-            new_signal_clone.send_now(new_value);
-            true
+        let another = another.as_ref();
+        let new_signal = Signal::new((
+            self.0.value.borrow().clone(),
+            another.0.value.borrow().clone(),
+        ));
+        let cloned_new_signal = new_signal.clone();
+        let cloned_new_signal_ = Box::new(new_signal.clone());
+        let cloned_new_signal__ = Box::new(new_signal.clone());
+        let result_new_signal = new_signal.clone();
+        let source_for_closure_self = Rc::clone(&self.0);
+        let source_for_closure_another = Rc::clone(&another.0);
+
+        let react_fn_self = Box::new(move || {
+            if !*new_signal.0.explicitly_modified.borrow() {
+                new_signal.modify(|v| v.0 = source_for_closure_self.value.borrow().clone());
+            }
         });
-        self.0.subscribers.borrow_mut().push(subscription);
-        new_signal
-    }
-
-    /// Map using weak references: if either signal is dropped, subscription is removed.
-    pub fn weak_map<F, U>(&self, f: F) -> Signal<'a, U>
-    where
-        F: Fn(&T) -> U + 'a,
-        U: 'a,
-        T: 'a,
-    {
-        // Original behavior captured weak references to avoid keeping signals alive.
-        let new_signal = Signal::new(f(&self.0.value.borrow()));
-        let weak_new_signal = Rc::downgrade(&new_signal.0);
-        let weak_self = Rc::downgrade(&self.0);
-        let subscription = Box::new(move || {
-            weak_new_signal
-                .upgrade()
-                .and_then(|new_signal_inner| {
-                    weak_self
-                        .upgrade()
-                        .map(|self_inner| (Signal(new_signal_inner), Signal(self_inner)))
-                })
-                .map(|(new_signal, self_signal)| {
-                    let new_value = f(&self_signal.0.value.borrow());
-                    new_signal.send_now(new_value);
-                    true
-                })
-                .unwrap_or(false)
+        let react_fn_another = Box::new(move || {
+            if !*cloned_new_signal.0.explicitly_modified.borrow() {
+                cloned_new_signal
+                    .modify(|v| v.1 = source_for_closure_another.value.borrow().clone());
+            }
         });
-        self.0.subscribers.borrow_mut().push(subscription);
-        new_signal
-    }
-    pub fn combine<U>(&self, other: &Signal<'a, U>) -> Signal<'a, (T, U)>
-    where
-        U: Clone + 'a,
-        T: Clone + 'a,
-    {
-        combine_impl(self, other, false)
+        self.0.react_fns.borrow_mut().push(react_fn_self);
+        another.0.react_fns.borrow_mut().push(react_fn_another);
+        self.0.successors.borrow_mut().push(cloned_new_signal_);
+        another.0.successors.borrow_mut().push(cloned_new_signal__);
+        result_new_signal
     }
 
-    pub fn weak_combine<U>(&self, other: &Signal<'a, U>) -> Signal<'a, (T, U)>
+    pub fn extend<S>(&self, others: impl IntoIterator<Item = S>) -> Signal<'a, Vec<T>>
     where
-        U: Clone + 'a,
-        T: Clone + 'a,
+        S: Liftable<'a, Inner = T>,
+        T: Clone,
     {
-        combine_impl(self, other, true)
+        // Collect the iterator into owned Signal clones so we don't keep
+        // references to temporary `S` values that would be dropped.
+        let others_signals: Vec<Signal<'a, T>> =
+            others.into_iter().map(|s| s.as_ref().clone()).collect();
+
+        let new_signal: Signal<'a, Vec<T>> = Signal::new(
+            iter::once(self)
+                .chain(others_signals.iter())
+                .map(|s| s.0.value.borrow().clone())
+                .collect(),
+        );
+        let result_new_signal = new_signal.clone();
+
+        iter::once(self)
+            .chain(others_signals.iter())
+            .enumerate()
+            .for_each(|(index, signal)| {
+                let new_signal_clone = new_signal.clone();
+                let cloned_new_signal_box = Box::new(new_signal.clone());
+                let source_for_closure = Rc::clone(&signal.0);
+
+                let react_fn = Box::new(move || {
+                    if !*new_signal_clone.0.explicitly_modified.borrow() {
+                        new_signal_clone.modify(|v| {
+                            v[index] = source_for_closure.value.borrow().clone();
+                        });
+                    }
+                });
+
+                signal.0.react_fns.borrow_mut().push(react_fn);
+                signal.0.successors.borrow_mut().push(cloned_new_signal_box);
+            });
+
+        result_new_signal
     }
 
-    pub fn sequence(signals: &[Signal<'a, T>]) -> Signal<'a, Vec<T>>
-    where
-        T: Clone + 'a,
-    {
-        sequence_impl(signals, false)
+    pub(crate) fn modify(&self, f: impl FnOnce(&mut T)) {
+        let mut value = self.0.value.borrow_mut();
+        f(&mut value);
     }
 
-    pub fn weak_sequence(signals: &[Signal<'a, T>]) -> Signal<'a, Vec<T>>
-    where
-        T: Clone + 'a,
-    {
-        sequence_impl(signals, true)
+    fn mark_dirty(&self) {
+        *self.0.dirty.borrow_mut() += 1;
     }
 
-    pub fn clone_refered(&self) -> Signal<'a, T> {
-        Signal(Rc::clone(&self.0))
+    fn collect_guards(&self, result: &mut Vec<SignalGuardInner<'a>>) {
+        self.mark_dirty();
+        result.push(SignalGuardInner(self.clone_box()));
+        for s in self.0.successors.borrow().iter() {
+            s.collect_guards_recursive(result);
+        }
+    }
+
+    pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> Signal<'a, [S::Inner; N]>
+    where
+        S: Liftable<'a>,
+        S::Inner: Clone + 'a,
+    {
+        let signals: [Signal<'a, S::Inner>; N] = std::array::from_fn(|i| items[i].as_ref().clone());
+
+        let initial: [S::Inner; N] = std::array::from_fn(|i| signals[i].0.value.borrow().clone());
+
+        let new_signal: Signal<'a, [S::Inner; N]> = Signal::new(initial);
+        let result_new_signal = new_signal.clone();
+
+        for (index, signal) in signals.iter().enumerate() {
+            let new_signal_clone = new_signal.clone();
+            let cloned_new_signal_box = Box::new(new_signal.clone());
+            let source_for_closure = Rc::clone(&signal.0);
+
+            let react_fn = Box::new(move || {
+                if !*new_signal_clone.0.explicitly_modified.borrow() {
+                    new_signal_clone.modify(|v| {
+                        v[index] = source_for_closure.value.borrow().clone();
+                    });
+                }
+            });
+
+            signal.0.react_fns.borrow_mut().push(react_fn);
+            signal.0.successors.borrow_mut().push(cloned_new_signal_box);
+        }
+
+        result_new_signal
     }
 }
 
-impl<'a, T> SignalInner<'a, T> {
-    fn notify_subscribers(&self) {
-        GLOBAL_BATCH_STATE.with(|bs| {
-            bs.enter_notification();
+impl<'a, T: 'a> SignalExt<'a> for Signal<'a, T> {
+    fn react(&self) {
+        self.0.react_fns.borrow().iter().for_each(|react_fn| {
+            react_fn();
         });
+    }
+    fn guard(&self) -> SignalGuard<'a> {
+        let mut result = vec![];
+        self.collect_guards(&mut result);
+        SignalGuard(result)
+    }
+    fn clone_box(&self) -> Box<dyn SignalExt<'a> + 'a> {
+        Box::new(Signal(Rc::clone(&self.0)))
+    }
+    fn decrease_dirty(&self) {
+        *self.0.dirty.borrow_mut() -= 1;
+    }
+    fn get_dirty(&self) -> isize {
+        *self.0.dirty.borrow()
+    }
+    fn reset_explicitly_modified(&self) {
+        *self.0.explicitly_modified.borrow_mut() = false;
+    }
+    fn collect_guards_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>) {
+        self.mark_dirty();
+        result.push(SignalGuardInner(self.clone_box()));
+        for s in self.0.successors.borrow().iter() {
+            s.collect_guards_recursive(result);
+        }
+    }
+}
 
-        let mut subscribers = self.subscribers.borrow_mut();
-        subscribers.retain(|subscriber| subscriber());
-        drop(subscribers);
+impl<T> Clone for Signal<'_, T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
-        GLOBAL_BATCH_STATE.with(|bs| {
-            bs.exit_notification();
+#[cfg(test)]
+mod tests {
+    use crate::api::LiftInto;
+
+    use super::*;
+
+    #[test]
+    fn test_signal() {
+        let a = Signal::new(0);
+        let _a = a.map(|x| println!("a changed: {}", x));
+        (a.send(100), a.send(5));
+    }
+
+    #[test]
+    fn test_signal2() {
+        let a = Signal::new(0);
+        let b = a.map(|x| x * 2);
+        let ab = a.with(&b);
+        let _ab = ab.map(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
+        (a.send(5), a.send(100));
+    }
+
+    #[test]
+    fn test_signal3() {
+        let a = Signal::new(0);
+        let b = a.map(|x| x * 2);
+        let ab = (&a, &b).lift();
+        let _ab = ab.map(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
+        (a.send(5), b.send(100));
+    }
+
+    #[test]
+    fn test_signal4() {
+        let a = Signal::new(0);
+        let b = Signal::new(10);
+        let c = Signal::new(20);
+        let abc = [&a, &b, &c].lift();
+        let _abc =
+            abc.map(|[x, y, z]| println!("d changed: {} + {} + {} = {}", x, y, z, x + y + z));
+        let d = Signal::new(0);
+        let abcd = abc.with(&d);
+        let _abcd = abcd.map(|numbers| {
+            println!(
+                "e changed: {} + {} + {} + {} = {}",
+                numbers.0[0],
+                numbers.0[1],
+                numbers.0[2],
+                numbers.1,
+                numbers.0.iter().sum::<i32>() + numbers.1
+            )
         });
+        (a.send(5), b.send(15), c.send(25), abc.send([2, 3, 4]));
     }
-}
-
-impl<'a, T, U> LiftInto<Signal<'a, (T, U)>> for (Signal<'a, T>, Signal<'a, U>)
-where
-    T: Clone + 'a,
-    U: Clone + 'a,
-{
-    fn lift(self) -> Signal<'a, (T, U)> {
-        self.0.combine(&self.1)
-    }
-}
-
-impl<'a, T, U> WeakLiftInto<Signal<'a, (T, U)>> for (Signal<'a, T>, Signal<'a, U>)
-where
-    T: Clone + 'a,
-    U: Clone + 'a,
-{
-    fn weak_lift(self) -> Signal<'a, (T, U)> {
-        self.0.weak_combine(&self.1)
-    }
-}
-
-impl<'a, T> LiftInto<Signal<'a, Vec<T>>> for &[Signal<'a, T>]
-where
-    T: Clone + 'a,
-{
-    fn lift(self) -> Signal<'a, Vec<T>> {
-        Signal::sequence(self)
-    }
-}
-
-impl<'a, T> LiftInto<Signal<'a, Vec<T>>> for Vec<Signal<'a, T>>
-where
-    T: Clone + 'a,
-{
-    fn lift(self) -> Signal<'a, Vec<T>> {
-        Signal::sequence(&self)
-    }
-}
-
-impl<'a, const N: usize, T> LiftInto<Signal<'a, Vec<T>>> for [Signal<'a, T>; N]
-where
-    T: Clone + 'a,
-{
-    fn lift(self) -> Signal<'a, Vec<T>> {
-        Signal::sequence(&self)
-    }
-}
-
-impl<'a, T> WeakLiftInto<Signal<'a, Vec<T>>> for &[Signal<'a, T>]
-where
-    T: Clone + 'a,
-{
-    fn weak_lift(self) -> Signal<'a, Vec<T>> {
-        Signal::weak_sequence(self)
-    }
-}
-
-impl<'a, T> WeakLiftInto<Signal<'a, Vec<T>>> for Vec<Signal<'a, T>>
-where
-    T: Clone + 'a,
-{
-    fn weak_lift(self) -> Signal<'a, Vec<T>> {
-        Signal::weak_sequence(&self)
-    }
-}
-
-impl<'a, const N: usize, T> WeakLiftInto<Signal<'a, Vec<T>>> for [Signal<'a, T>; N]
-where
-    T: Clone + 'a,
-{
-    fn weak_lift(self) -> Signal<'a, Vec<T>> {
-        Signal::weak_sequence(&self)
-    }
-}
-
-fn combine_impl<'a, T, U>(
-    left: &Signal<'a, T>,
-    right: &Signal<'a, U>,
-    use_weak: bool,
-) -> Signal<'a, (T, U)>
-where
-    U: Clone + 'a,
-    T: Clone + 'a,
-{
-    use crate::api::RcRef;
-
-    let new_combined = Signal::new((
-        left.0.value.borrow().clone(),
-        right.0.value.borrow().clone(),
-    ));
-
-    let create_subscription =
-        |left: &Signal<'a, T>, right: &Signal<'a, U>, combined: &Signal<'a, (T, U)>| {
-            let ref_combined = RcRef::new(Rc::clone(&combined.0), use_weak);
-            let ref_left = RcRef::new(Rc::clone(&left.0), use_weak);
-            let ref_right = RcRef::new(Rc::clone(&right.0), use_weak);
-
-            let last_left_version = RefCell::new(0u64);
-            let last_right_version = RefCell::new(0u64);
-
-            Box::new(move || {
-                ref_combined
-                    .upgrade()
-                    .zip(ref_left.upgrade())
-                    .zip(ref_right.upgrade())
-                    .map(|((combined_inner, left_inner), right_inner)| {
-                        let left_ver = *left_inner.version.borrow();
-                        let right_ver = *right_inner.version.borrow();
-                        let left_changed = left_ver != *last_left_version.borrow();
-                        let right_changed = right_ver != *last_right_version.borrow();
-
-                        if left_changed || right_changed {
-                            *last_left_version.borrow_mut() = left_ver;
-                            *last_right_version.borrow_mut() = right_ver;
-
-                            let combined = Signal(combined_inner);
-                            combined.send_deferred_with(|tuple| {
-                                if left_changed {
-                                    tuple.0 = left_inner.value.borrow().clone();
-                                }
-                                if right_changed {
-                                    tuple.1 = right_inner.value.borrow().clone();
-                                }
-                            });
-                        }
-                        true
-                    })
-                    .unwrap_or(false)
-            }) as Box<dyn Fn() -> bool + 'a>
-        };
-
-    left.0
-        .subscribers
-        .borrow_mut()
-        .push(create_subscription(left, right, &new_combined));
-    right
-        .0
-        .subscribers
-        .borrow_mut()
-        .push(create_subscription(left, right, &new_combined));
-
-    new_combined
-}
-
-fn sequence_impl<'a, T>(signals: &[Signal<'a, T>], use_weak: bool) -> Signal<'a, Vec<T>>
-where
-    T: Clone + 'a,
-{
-    use crate::api::RcRef;
-
-    let initial_values: Vec<T> = signals.iter().map(|s| s.0.value.borrow().clone()).collect();
-    let new_sequence = Signal::new(initial_values);
-
-    let create_subscription = |signals: &[Signal<'a, T>], sequence: &Signal<'a, Vec<T>>| {
-        let ref_sequence = RcRef::new(Rc::clone(&sequence.0), use_weak);
-        let ref_signals: Vec<_> = signals
-            .iter()
-            .map(|s| RcRef::new(Rc::clone(&s.0), use_weak))
-            .collect();
-
-        let last_versions = RefCell::new(vec![0u64; signals.len()]);
-
-        Box::new(move || {
-            ref_sequence
-                .upgrade()
-                .and_then(|sequence_inner| {
-                    let upgraded: Option<Vec<_>> =
-                        ref_signals.iter().map(|rs| rs.upgrade()).collect();
-
-                    upgraded.map(|signal_inners| {
-                        let versions: Vec<u64> = signal_inners
-                            .iter()
-                            .map(|si| *si.version.borrow())
-                            .collect();
-
-                        let last = last_versions.borrow();
-                        let changed_indices: Vec<_> = versions
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, &v)| (v != last[i]).then_some(i))
-                            .collect();
-
-                        if !changed_indices.is_empty() {
-                            drop(last);
-                            *last_versions.borrow_mut() = versions;
-
-                            let sequence = Signal(sequence_inner);
-                            sequence.send_deferred_with(|vec| {
-                                for &i in &changed_indices {
-                                    vec[i] = signal_inners[i].value.borrow().clone();
-                                }
-                            });
-                        }
-                        true
-                    })
-                })
-                .unwrap_or(false)
-        }) as Box<dyn Fn() -> bool + 'a>
-    };
-
-    for signal in signals {
-        signal
-            .0
-            .subscribers
-            .borrow_mut()
-            .push(create_subscription(signals, &new_sequence));
-    }
-
-    new_sequence
 }
