@@ -84,18 +84,20 @@ pub fn derive_lift(input: TokenStream) -> TokenStream {
 
         quote! {
             {
-                let result_signal_clone = result_signal.clone();
-                let source_for_closure = std::rc::Rc::clone(&instance.#field_name.0);
+                let result_signal_weak = std::rc::Rc::downgrade(&result_signal.0);
+                let source_for_closure = std::rc::Rc::downgrade(&instance.#field_name.0);
                 let react_fn = Box::new(move || {
-                    if !*result_signal_clone.0.explicitly_modified.borrow() {
-                        result_signal_clone.modify(|v| {
-                            v.#field_name = source_for_closure.value.borrow().clone();
-                        });
+                    if let Some(result_sig) = result_signal_weak.upgrade() {
+                        if !*result_sig.explicitly_modified.borrow() {
+                            if let Some(source) = source_for_closure.upgrade() {
+                                result_sig.value.borrow_mut().#field_name = source.value.borrow().clone();
+                            }
+                        }
                     }
                 });
                 let cloned_signal = instance.#field_name.clone();
                 cloned_signal.0.react_fns.borrow_mut().push(react_fn);
-                cloned_signal.0.successors.borrow_mut().push(Box::new(result_signal.clone()));
+                cloned_signal.0.successors.borrow_mut().push(crate::signal::WeakSignalRef::new(&result_signal));
             }
         }
     });

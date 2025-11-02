@@ -52,7 +52,7 @@ mod tests {
         // From Point to Signal<_Point>
         let lifted = point.clone().lift();
 
-        lifted.map(|inner| {
+        let _observer = lifted.map(|inner| {
             println!("Point {}: ({}, {})", inner.label, inner.x, inner.y);
         });
 

@@ -1,105 +1,86 @@
-use std::{cell::RefCell, iter, rc::Rc};
+use std::{
+    cell::RefCell,
+    iter,
+    rc::{Rc, Weak},
+};
 
 use crate::api::Liftable;
 
-pub(crate) trait SignalExt<'a> {
-    fn get_ptr(&self) -> *const ();
-    fn fire_reactions(&self);
+pub trait SignalExt<'a> {
+    fn react(&self);
+    fn guard(&self) -> SignalGuard<'a>;
+    fn decrease_dirty(&self);
+    fn get_dirty(&self) -> isize;
     fn clone_box(&self) -> Box<dyn SignalExt<'a> + 'a>;
+    fn collect_guards_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>);
+    fn collect_predecessors_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>);
+    fn reset_explicitly_modified(&self);
 }
 
-// Thread-local storage for batch processing
+// Helper struct to hold weak references that can be upgraded
+pub struct WeakSignalRef<'a> {
+    upgrade: Box<dyn Fn() -> Option<Box<dyn SignalExt<'a> + 'a>> + 'a>,
+}
+
+impl<'a> WeakSignalRef<'a> {
+    pub fn new<T: 'a>(signal: &Signal<'a, T>) -> Self {
+        let weak = Rc::downgrade(&signal.0);
+        WeakSignalRef {
+            upgrade: Box::new(move || {
+                weak.upgrade()
+                    .map(|rc| Box::new(Signal(rc)) as Box<dyn SignalExt<'a> + 'a>)
+            }),
+        }
+    }
+
+    pub fn upgrade(&self) -> Option<Box<dyn SignalExt<'a> + 'a>> {
+        (self.upgrade)()
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.upgrade().is_some()
+    }
+}
+
 thread_local! {
-    // Signals that have been explicitly modified and need processing
-    // Uses HashMap to allow updates to override previous entries
-    static MODIFIED_SIGNALS: RefCell<std::collections::HashMap<*const (), unsafe fn(*const ())>> = RefCell::new(std::collections::HashMap::new());
-    // Order in which signals were marked (for processing in order)
-    static SIGNAL_ORDER: RefCell<Vec<*const ()>> = RefCell::new(Vec::new());
-    // Guards depth tracking for nested sends
     static GUARD_DEPTH: RefCell<usize> = RefCell::new(0);
 }
 
-// Mark a signal as modified in this batch
-fn mark_signal_modified<'a, T: 'a>(signal: &Signal<'a, T>) {
-    let ptr = Rc::as_ptr(&signal.0) as *const ();
-
-    unsafe fn fire<T>(ptr: *const ()) {
-        unsafe {
-            let inner_ptr = ptr as *const SignalInner<T>;
-            let inner_ref = &*inner_ptr;
-            inner_ref.react_fns.borrow().iter().for_each(|f| f());
-            *inner_ref.explicitly_modified.borrow_mut() = false;
-        }
-    }
-
-    // Insert into map (replaces old entry if present)
-    MODIFIED_SIGNALS.with(|modified| {
-        modified
-            .borrow_mut()
-            .insert(ptr, fire::<T> as unsafe fn(*const ()));
-    });
-
-    // Update order - if already present, move to end (later modification wins)
-    SIGNAL_ORDER.with(|order| {
-        let mut vec = order.borrow_mut();
-        // Remove from current position if present
-        if let Some(pos) = vec.iter().position(|p| *p == ptr) {
-            vec.remove(pos);
-        }
-        // Add to end
-        vec.push(ptr);
-    });
-}
-
-// Process all modified signals in topological order
-fn process_batch() {
-    // Keep processing until no more signals are marked
-    loop {
-        // Get the order of signals to process
-        let order: Vec<*const ()> = SIGNAL_ORDER.with(|ord| std::mem::take(&mut *ord.borrow_mut()));
-
-        if order.is_empty() {
-            break;
-        }
-
-        // Fire signals in order, each with its final value from the HashMap
-        for ptr in order {
-            // Get and remove the fire function
-            let fire_fn_opt = MODIFIED_SIGNALS.with(|modified| modified.borrow_mut().remove(&ptr));
-
-            if let Some(fire_fn) = fire_fn_opt {
-                unsafe { fire_fn(ptr) };
-            }
-        }
-    }
-}
+pub struct SignalGuardInner<'a>(Box<dyn SignalExt<'a> + 'a>);
 
 #[allow(dead_code)]
 #[allow(unused_must_use)]
-pub struct SignalGuard<'a> {
-    _phantom: std::marker::PhantomData<&'a ()>,
+pub struct SignalGuard<'a>(Vec<SignalGuardInner<'a>>);
+
+impl<'a> Drop for SignalGuardInner<'a> {
+    fn drop(&mut self) {
+        self.0.decrease_dirty();
+        if self.0.get_dirty() == 0 {
+            self.0.react();
+            self.0.reset_explicitly_modified();
+        }
+    }
 }
 
 impl<'a> Drop for SignalGuard<'a> {
     fn drop(&mut self) {
-        // Decrement depth
-        let depth_after = GUARD_DEPTH.with(|d| {
-            let current = *d.borrow();
-            *d.borrow_mut() = current.saturating_sub(1);
-            current.saturating_sub(1)
-        });
+        // First drop all inner guards (triggers immediate reactions)
+        drop(std::mem::take(&mut self.0));
 
-        // Process batch when all guards are dropped
-        if depth_after == 0 {
-            process_batch();
-        }
+        // Decrement depth
+        GUARD_DEPTH.with(|d| {
+            let current = *d.borrow();
+            *d.borrow_mut() = current - 1;
+        });
     }
 }
 
 pub struct SignalInner<'a, T> {
     pub(crate) value: RefCell<T>,
     pub(crate) react_fns: RefCell<Vec<Box<dyn Fn() + 'a>>>,
-    pub(crate) successors: RefCell<Vec<Box<dyn SignalExt<'a> + 'a>>>,
+    pub(crate) successors: RefCell<Vec<WeakSignalRef<'a>>>,
+    pub(crate) predecessors: RefCell<Vec<WeakSignalRef<'a>>>,
+    pub(crate) dirty: RefCell<isize>,
     pub(crate) explicitly_modified: RefCell<bool>,
 }
 
@@ -111,39 +92,25 @@ impl<'a, T: 'a> Signal<'a, T> {
             value: RefCell::new(initial),
             react_fns: RefCell::new(Vec::new()),
             successors: RefCell::new(Vec::new()),
+            predecessors: RefCell::new(Vec::new()),
+            dirty: RefCell::new(0),
             explicitly_modified: RefCell::new(false),
         });
         Signal(inner)
     }
 
     pub fn send(&self, new_value: T) -> SignalGuard<'a> {
-        GUARD_DEPTH.with(|d| *d.borrow_mut() += 1);
-
         self.modify(|v| *v = new_value);
         *self.0.explicitly_modified.borrow_mut() = true;
-
-        // Mark this signal as modified
-        mark_signal_modified(self);
-
-        SignalGuard {
-            _phantom: std::marker::PhantomData,
-        }
+        self.guard()
     }
 
     pub fn send_with<F>(&self, f: F) -> SignalGuard<'a>
     where
         F: FnOnce(&mut T),
     {
-        GUARD_DEPTH.with(|d| *d.borrow_mut() += 1);
-
         self.modify(f);
-
-        // Mark this signal as modified
-        mark_signal_modified(self);
-
-        SignalGuard {
-            _phantom: std::marker::PhantomData,
-        }
+        self.guard()
     }
 
     pub fn map<U: 'a, F>(&self, f: F) -> Signal<'a, U>
@@ -151,24 +118,27 @@ impl<'a, T: 'a> Signal<'a, T> {
         F: Fn(&T) -> U + 'a,
     {
         let new_signal = Signal::new(f(&self.0.value.borrow()));
-        let cloned_new_signal = Box::new(new_signal.clone());
         let result_new_signal = new_signal.clone();
-        let source_for_closure = Rc::clone(&self.0);
-        let new_signal_for_mark = new_signal.clone();
+        let new_signal_for_react = Rc::downgrade(&new_signal.0);
+        let source_for_closure = Rc::downgrade(&self.0);
 
         let react_fn = Box::new(move || {
             // Only update if the signal wasn't explicitly modified
-            if !*new_signal.0.explicitly_modified.borrow() {
-                let new_value = f(&source_for_closure.value.borrow());
-                new_signal.modify(|v| *v = new_value);
-
-                // Mark derived signal as modified so its reactions fire
-                mark_signal_modified(&new_signal_for_mark);
+            if let Some(new_sig) = new_signal_for_react.upgrade() {
+                if !*new_sig.explicitly_modified.borrow() {
+                    if let Some(source) = source_for_closure.upgrade() {
+                        let new_value = f(&source.value.borrow());
+                        *new_sig.value.borrow_mut() = new_value;
+                    }
+                }
             }
         });
 
         self.0.react_fns.borrow_mut().push(react_fn);
-        self.0.successors.borrow_mut().push(cloned_new_signal);
+        self.0
+            .successors
+            .borrow_mut()
+            .push(WeakSignalRef::new(&new_signal));
         result_new_signal
     }
 
@@ -179,26 +149,33 @@ impl<'a, T: 'a> Signal<'a, T> {
     {
         let new_signal = Signal::new(U::default());
         let result_new_signal = new_signal.clone();
-        let source_inner = Rc::clone(&self.0);
-        let new_signal_rc = Rc::clone(&new_signal.0);
+        let source_inner = Rc::downgrade(&self.0);
+        let new_signal_rc = Rc::downgrade(&new_signal.0);
 
-        let source_signal = Signal(Rc::clone(&source_inner));
         let react_fn = Box::new(move || {
-            if *new_signal_rc.explicitly_modified.borrow() {
-                let u_value_ref = new_signal_rc.value.borrow();
-                let t_value = f(&u_value_ref);
-                drop(u_value_ref);
+            if let Some(new_sig) = new_signal_rc.upgrade() {
+                if *new_sig.explicitly_modified.borrow() {
+                    let u_value_ref = new_sig.value.borrow();
+                    let t_value = f(&u_value_ref);
+                    drop(u_value_ref);
 
-                *source_inner.value.borrow_mut() = t_value;
-                *source_inner.explicitly_modified.borrow_mut() = true;
-
-                // Mark parent signal as modified for batch processing
-                mark_signal_modified(&source_signal);
-
-                *new_signal_rc.explicitly_modified.borrow_mut() = false;
+                    if let Some(source) = source_inner.upgrade() {
+                        *source.value.borrow_mut() = t_value;
+                        *source.explicitly_modified.borrow_mut() = true;
+                    }
+                }
             }
         });
         new_signal.0.react_fns.borrow_mut().push(react_fn);
+
+        // Register self (source/result) as a predecessor of new_signal (backward dependency)
+        // When new_signal changes, it propagates backward to self
+        new_signal
+            .0
+            .predecessors
+            .borrow_mut()
+            .push(WeakSignalRef::new(self));
+
         result_new_signal
     }
 
@@ -210,21 +187,20 @@ impl<'a, T: 'a> Signal<'a, T> {
     {
         let new_signal = Signal::new(U::default());
         let result_new_signal = new_signal.clone();
-        let new_signal_for_forward = new_signal.clone();
-        let source_inner = Rc::clone(&self.0);
-        let new_signal_rc = Rc::clone(&new_signal.0);
+        let source_inner = Rc::downgrade(&self.0);
+        let new_signal_rc = Rc::downgrade(&new_signal.0);
 
         // Forward reaction: T -> U (covariant)
-        let new_signal_for_mark = new_signal_for_forward.clone();
         let forward_react_fn = Box::new(move || {
-            if !*new_signal_rc.explicitly_modified.borrow() {
-                let t_value = source_inner.value.borrow();
-                let u_value = f(&t_value);
-                drop(t_value);
-                new_signal_for_forward.modify(|v| *v = u_value);
-
-                // Mark derived signal as modified so its reactions fire
-                mark_signal_modified(&new_signal_for_mark);
+            if let Some(new_sig) = new_signal_rc.upgrade() {
+                if !*new_sig.explicitly_modified.borrow() {
+                    if let Some(source) = source_inner.upgrade() {
+                        let t_value = source.value.borrow();
+                        let u_value = f(&t_value);
+                        drop(t_value);
+                        *new_sig.value.borrow_mut() = u_value;
+                    }
+                }
             }
         });
 
@@ -232,29 +208,35 @@ impl<'a, T: 'a> Signal<'a, T> {
         self.0
             .successors
             .borrow_mut()
-            .push(Box::new(new_signal.clone()));
+            .push(WeakSignalRef::new(&new_signal));
 
         // Backward reaction: U -> T (contravariant)
-        let source_inner_back = Rc::clone(&self.0);
-        let new_signal_rc_back = Rc::clone(&new_signal.0);
-        let source_signal_back = Signal(Rc::clone(&source_inner_back));
+        let source_inner_back = Rc::downgrade(&self.0);
+        let new_signal_rc_back = Rc::downgrade(&new_signal.0);
 
         let backward_react_fn = Box::new(move || {
-            if *new_signal_rc_back.explicitly_modified.borrow() {
-                let u_value_ref = new_signal_rc_back.value.borrow();
-                let t_value = g(&u_value_ref);
-                drop(u_value_ref);
+            if let Some(new_sig) = new_signal_rc_back.upgrade() {
+                if *new_sig.explicitly_modified.borrow() {
+                    let u_value_ref = new_sig.value.borrow();
+                    let t_value = g(&u_value_ref);
+                    drop(u_value_ref);
 
-                *source_inner_back.value.borrow_mut() = t_value;
-                *source_inner_back.explicitly_modified.borrow_mut() = true;
-
-                // Mark parent signal as modified for batch processing
-                mark_signal_modified(&source_signal_back);
-
-                *new_signal_rc_back.explicitly_modified.borrow_mut() = false;
+                    if let Some(source) = source_inner_back.upgrade() {
+                        *source.value.borrow_mut() = t_value;
+                        *source.explicitly_modified.borrow_mut() = true;
+                    }
+                }
             }
         });
         new_signal.0.react_fns.borrow_mut().push(backward_react_fn);
+
+        // Register self (source) as a predecessor of new_signal (backward dependency)
+        // When new_signal changes, it propagates backward to self
+        new_signal
+            .0
+            .predecessors
+            .borrow_mut()
+            .push(WeakSignalRef::new(self));
 
         result_new_signal
     }
@@ -270,32 +252,41 @@ impl<'a, T: 'a> Signal<'a, T> {
             self.0.value.borrow().clone(),
             another.0.value.borrow().clone(),
         ));
-        let cloned_new_signal = new_signal.clone();
-        let cloned_new_signal_ = Box::new(new_signal.clone());
-        let cloned_new_signal__ = Box::new(new_signal.clone());
         let result_new_signal = new_signal.clone();
-        let source_for_closure_self = Rc::clone(&self.0);
-        let source_for_closure_another = Rc::clone(&another.0);
+        let new_signal_weak = Rc::downgrade(&new_signal.0);
+        let new_signal_weak_2 = Rc::downgrade(&new_signal.0);
+        let source_for_closure_self = Rc::downgrade(&self.0);
+        let source_for_closure_another = Rc::downgrade(&another.0);
 
-        let new_signal_for_mark_self = new_signal.clone();
         let react_fn_self = Box::new(move || {
-            if !*new_signal.0.explicitly_modified.borrow() {
-                new_signal.modify(|v| v.0 = source_for_closure_self.value.borrow().clone());
-                mark_signal_modified(&new_signal_for_mark_self);
+            if let Some(new_sig) = new_signal_weak.upgrade() {
+                if !*new_sig.explicitly_modified.borrow() {
+                    if let Some(source) = source_for_closure_self.upgrade() {
+                        new_sig.value.borrow_mut().0 = source.value.borrow().clone();
+                    }
+                }
             }
         });
-        let new_signal_for_mark_another = cloned_new_signal.clone();
         let react_fn_another = Box::new(move || {
-            if !*cloned_new_signal.0.explicitly_modified.borrow() {
-                cloned_new_signal
-                    .modify(|v| v.1 = source_for_closure_another.value.borrow().clone());
-                mark_signal_modified(&new_signal_for_mark_another);
+            if let Some(new_sig) = new_signal_weak_2.upgrade() {
+                if !*new_sig.explicitly_modified.borrow() {
+                    if let Some(source) = source_for_closure_another.upgrade() {
+                        new_sig.value.borrow_mut().1 = source.value.borrow().clone();
+                    }
+                }
             }
         });
         self.0.react_fns.borrow_mut().push(react_fn_self);
         another.0.react_fns.borrow_mut().push(react_fn_another);
-        self.0.successors.borrow_mut().push(cloned_new_signal_);
-        another.0.successors.borrow_mut().push(cloned_new_signal__);
+        self.0
+            .successors
+            .borrow_mut()
+            .push(WeakSignalRef::new(&result_new_signal));
+        another
+            .0
+            .successors
+            .borrow_mut()
+            .push(WeakSignalRef::new(&result_new_signal));
         result_new_signal
     }
 
@@ -321,22 +312,25 @@ impl<'a, T: 'a> Signal<'a, T> {
             .chain(others_signals.iter())
             .enumerate()
             .for_each(|(index, signal)| {
-                let new_signal_clone = new_signal.clone();
-                let cloned_new_signal_box = Box::new(new_signal.clone());
-                let source_for_closure = Rc::clone(&signal.0);
-                let new_signal_for_mark = new_signal.clone();
+                let new_signal_weak = Rc::downgrade(&new_signal.0);
+                let source_for_closure = Rc::downgrade(&signal.0);
 
                 let react_fn = Box::new(move || {
-                    if !*new_signal_clone.0.explicitly_modified.borrow() {
-                        new_signal_clone.modify(|v| {
-                            v[index] = source_for_closure.value.borrow().clone();
-                        });
-                        mark_signal_modified(&new_signal_for_mark);
+                    if let Some(new_sig) = new_signal_weak.upgrade() {
+                        if !*new_sig.explicitly_modified.borrow() {
+                            if let Some(source) = source_for_closure.upgrade() {
+                                new_sig.value.borrow_mut()[index] = source.value.borrow().clone();
+                            }
+                        }
                     }
                 });
 
                 signal.0.react_fns.borrow_mut().push(react_fn);
-                signal.0.successors.borrow_mut().push(cloned_new_signal_box);
+                signal
+                    .0
+                    .successors
+                    .borrow_mut()
+                    .push(WeakSignalRef::new(&new_signal));
             });
 
         result_new_signal
@@ -345,6 +339,27 @@ impl<'a, T: 'a> Signal<'a, T> {
     pub(crate) fn modify(&self, f: impl FnOnce(&mut T)) {
         let mut value = self.0.value.borrow_mut();
         f(&mut value);
+    }
+
+    fn mark_dirty(&self) {
+        *self.0.dirty.borrow_mut() += 1;
+    }
+
+    fn collect_guards(&self, result: &mut Vec<SignalGuardInner<'a>>) {
+        self.mark_dirty();
+        result.push(SignalGuardInner(self.clone_box()));
+        self.0.successors.borrow_mut().retain(|s| s.is_alive());
+        for s in self.0.successors.borrow().iter() {
+            if let Some(signal) = s.upgrade() {
+                signal.collect_guards_recursive(result);
+            }
+        }
+        self.0.predecessors.borrow_mut().retain(|s| s.is_alive());
+        for s in self.0.predecessors.borrow().iter() {
+            if let Some(signal) = s.upgrade() {
+                signal.collect_predecessors_recursive(result);
+            }
+        }
     }
 
     pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> Signal<'a, [S::Inner; N]>
@@ -360,22 +375,25 @@ impl<'a, T: 'a> Signal<'a, T> {
         let result_new_signal = new_signal.clone();
 
         for (index, signal) in signals.iter().enumerate() {
-            let new_signal_clone = new_signal.clone();
-            let cloned_new_signal_box = Box::new(new_signal.clone());
-            let source_for_closure = Rc::clone(&signal.0);
-            let new_signal_for_mark = new_signal.clone();
+            let new_signal_weak = Rc::downgrade(&new_signal.0);
+            let source_for_closure = Rc::downgrade(&signal.0);
 
             let react_fn = Box::new(move || {
-                if !*new_signal_clone.0.explicitly_modified.borrow() {
-                    new_signal_clone.modify(|v| {
-                        v[index] = source_for_closure.value.borrow().clone();
-                    });
-                    mark_signal_modified(&new_signal_for_mark);
+                if let Some(new_sig) = new_signal_weak.upgrade() {
+                    if !*new_sig.explicitly_modified.borrow() {
+                        if let Some(source) = source_for_closure.upgrade() {
+                            new_sig.value.borrow_mut()[index] = source.value.borrow().clone();
+                        }
+                    }
                 }
             });
 
             signal.0.react_fns.borrow_mut().push(react_fn);
-            signal.0.successors.borrow_mut().push(cloned_new_signal_box);
+            signal
+                .0
+                .successors
+                .borrow_mut()
+                .push(WeakSignalRef::new(&new_signal));
         }
 
         result_new_signal
@@ -383,25 +401,63 @@ impl<'a, T: 'a> Signal<'a, T> {
 }
 
 impl<'a, T: 'a> SignalExt<'a> for Signal<'a, T> {
-    fn get_ptr(&self) -> *const () {
-        Rc::as_ptr(&self.0) as *const ()
-    }
-
-    fn fire_reactions(&self) {
+    fn react(&self) {
         self.0.react_fns.borrow().iter().for_each(|react_fn| {
             react_fn();
         });
-        *self.0.explicitly_modified.borrow_mut() = false;
     }
-
+    fn guard(&self) -> SignalGuard<'a> {
+        GUARD_DEPTH.with(|d| *d.borrow_mut() += 1);
+        let mut result = vec![];
+        self.collect_guards(&mut result);
+        SignalGuard(result)
+    }
     fn clone_box(&self) -> Box<dyn SignalExt<'a> + 'a> {
         Box::new(Signal(Rc::clone(&self.0)))
+    }
+    fn decrease_dirty(&self) {
+        *self.0.dirty.borrow_mut() -= 1;
+    }
+    fn get_dirty(&self) -> isize {
+        *self.0.dirty.borrow()
+    }
+    fn reset_explicitly_modified(&self) {
+        *self.0.explicitly_modified.borrow_mut() = false;
+    }
+    fn collect_guards_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>) {
+        self.mark_dirty();
+        result.push(SignalGuardInner(self.clone_box()));
+        // Retain only alive weak references and upgrade them
+        self.0.successors.borrow_mut().retain(|s| s.is_alive());
+        for s in self.0.successors.borrow().iter() {
+            if let Some(signal) = s.upgrade() {
+                signal.collect_guards_recursive(result);
+            }
+        }
+    }
+    fn collect_predecessors_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>) {
+        self.mark_dirty();
+        result.push(SignalGuardInner(self.clone_box()));
+        // Collect predecessors last so they drop last (react last)
+        // Retain only alive weak references and upgrade them
+        self.0.predecessors.borrow_mut().retain(|s| s.is_alive());
+        for s in self.0.predecessors.borrow().iter() {
+            if let Some(signal) = s.upgrade() {
+                signal.collect_predecessors_recursive(result);
+            }
+        }
     }
 }
 
 impl<T> Clone for Signal<'_, T> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+impl<'a, T> AsRef<Signal<'a, T>> for Signal<'a, T> {
+    fn as_ref(&self) -> &Signal<'a, T> {
+        self
     }
 }
 
@@ -423,6 +479,7 @@ mod tests {
         let a = Signal::new(0);
         let b = a.map(|x| x * 2);
         let _b = b.map(|x| println!("b changed: {}", x));
+        drop(b);
         a.send(100);
     }
 
@@ -524,5 +581,49 @@ mod tests {
         (a.send(20), c.send(50));
         println!("--- Sending to b and c ---");
         (b.send(30), c.send(60));
+    }
+
+    #[test]
+    fn test_high_order_signal() {
+        let source = Signal::new(0);
+        let derived = source.map(|x| Signal::new(x + 1));
+        let _ = derived.map(|s| s.send(233));
+        let _ = derived.map(|s| s.map(|x| println!("derived changed: {}", x)));
+        source.send(5);
+    }
+
+    #[test]
+    fn test_simultaneous_signals_dirty_mark() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let counter = Rc::new(RefCell::new(0));
+
+        let result = Signal::new(42);
+        let source1 = result.comap(|x| x + 1);
+        let source2 = source1.comap(|x| x * 2);
+
+        let counter_clone = counter.clone();
+        let _ = result.map(move |x| {
+            *counter_clone.borrow_mut() += 1;
+            println!(
+                "result changed: {} (trigger #{})",
+                x,
+                *counter_clone.borrow()
+            );
+        });
+
+        println!("--- Initial state ---");
+        println!("Counter: {}", *counter.borrow());
+
+        println!("\n--- Sending to source1 and source2 simultaneously ---");
+        *counter.borrow_mut() = 0;
+        (source1.send(300), source2.send(400));
+        println!("Result was triggered {} time(s)", *counter.borrow());
+        assert_eq!(
+            *counter.borrow(),
+            1,
+            "Result should only be triggered once when source1 and source2 are sent simultaneously"
+        );
     }
 }
