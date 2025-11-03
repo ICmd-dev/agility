@@ -59,7 +59,7 @@ where
     S2::Inner: Clone + 'a,
 {
     fn lift(self) -> Signal<'a, (S1::Inner, S2::Inner)> {
-        self.0.as_ref().with(self.1.as_ref())
+        self.0.as_ref().combine(self.1.as_ref())
     }
 }
 
@@ -99,7 +99,7 @@ where
     S2::Inner: Clone + Send + Sync + 'a,
 {
     fn lift(self) -> SignalSync<'a, (S1::Inner, S2::Inner)> {
-        self.0.as_ref().with(self.1.as_ref())
+        self.0.as_ref().combine(self.1.as_ref())
     }
 }
 

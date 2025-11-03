@@ -8,7 +8,7 @@ use std::{
 
 use crate::api::LiftableSync;
 
-pub trait SignalExtSync<'a> {
+pub trait SignalExtSync<'a>: Send + Sync {
     fn react(&self);
     fn guard(&self) -> SignalGuardSync<'a>;
     fn decrease_dirty(&self);
@@ -19,8 +19,51 @@ pub trait SignalExtSync<'a> {
     fn reset_explicitly_modified(&self);
 }
 
+// Strategy trait for reference handling (thread-safe version)
+pub(crate) trait RefStrategySync<'a>: Sized {
+    type Ref<T: 'a + Send + Sync>: Send + Sync;
+
+    fn new_ref<T: 'a + Send + Sync>(signal: &SignalSync<'a, T>) -> Self::Ref<T>;
+    fn upgrade_ref<T: 'a + Send + Sync>(ref_: &Self::Ref<T>)
+    -> Option<Arc<SignalInnerSync<'a, T>>>;
+}
+
+// Weak reference strategy - allows garbage collection
+pub(crate) struct WeakRefStrategySync;
+
+impl<'a> RefStrategySync<'a> for WeakRefStrategySync {
+    type Ref<T: 'a + Send + Sync> = std::sync::Weak<SignalInnerSync<'a, T>>;
+
+    fn new_ref<T: 'a + Send + Sync>(signal: &SignalSync<'a, T>) -> Self::Ref<T> {
+        Arc::downgrade(&signal.0)
+    }
+
+    fn upgrade_ref<T: 'a + Send + Sync>(
+        ref_: &Self::Ref<T>,
+    ) -> Option<Arc<SignalInnerSync<'a, T>>> {
+        ref_.upgrade()
+    }
+}
+
+// Strong reference strategy - holds strong references
+pub(crate) struct StrongRefStrategySync;
+
+impl<'a> RefStrategySync<'a> for StrongRefStrategySync {
+    type Ref<T: 'a + Send + Sync> = Arc<SignalInnerSync<'a, T>>;
+
+    fn new_ref<T: 'a + Send + Sync>(signal: &SignalSync<'a, T>) -> Self::Ref<T> {
+        signal.0.clone()
+    }
+
+    fn upgrade_ref<T: 'a + Send + Sync>(
+        ref_: &Self::Ref<T>,
+    ) -> Option<Arc<SignalInnerSync<'a, T>>> {
+        Some(ref_.clone())
+    }
+}
+
 // Helper struct to hold weak references that can be upgraded (thread-safe version)
-pub struct WeakSignalRefSync<'a> {
+pub(crate) struct WeakSignalRefSync<'a> {
     upgrade: Box<dyn Fn() -> Option<Box<dyn SignalExtSync<'a> + 'a>> + Send + Sync + 'a>,
 }
 
@@ -97,7 +140,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         self.guard()
     }
 
-    pub fn send_with<F>(&self, f: F) -> SignalGuardSync<'a>
+    pub fn send_combine<F>(&self, f: F) -> SignalGuardSync<'a>
     where
         F: FnOnce(&mut T),
     {
@@ -109,17 +152,32 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     where
         F: Fn(&T) -> U + Send + Sync + 'a,
     {
+        self.map_ref::<U, F, WeakRefStrategySync>(f)
+    }
+
+    pub fn with<U: Send + Sync + 'a, F>(&self, f: F) -> SignalSync<'a, U>
+    where
+        F: Fn(&T) -> U + Send + Sync + 'a,
+    {
+        self.map_ref::<U, F, StrongRefStrategySync>(f)
+    }
+
+    fn map_ref<U: Send + Sync + 'a, F, S: RefStrategySync<'a>>(&self, f: F) -> SignalSync<'a, U>
+    where
+        F: Fn(&T) -> U + Send + Sync + 'a,
+        S: 'a,
+    {
         let new_signal = SignalSync::new(f(&self.0.value.lock().unwrap()));
         let result_new_signal = new_signal.clone();
-        let new_signal_for_react = Arc::downgrade(&new_signal.0);
-        let source_for_closure = Arc::downgrade(&self.0);
+
+        let new_signal_ref = S::new_ref(&new_signal);
+        let source_ref = S::new_ref(self);
 
         let react_fn = Box::new(move || {
-            // Only update if the signal wasn't explicitly modified
-            if let Some(new_sig) = new_signal_for_react.upgrade() {
+            if let Some(new_sig) = S::upgrade_ref(&new_signal_ref) {
                 if !new_sig.explicitly_modified.load(Ordering::Acquire) {
-                    if let Some(source) = source_for_closure.upgrade() {
-                        let new_value = f(&source.value.lock().unwrap());
+                    if let Some(src) = S::upgrade_ref(&source_ref) {
+                        let new_value = f(&src.value.lock().unwrap());
                         *new_sig.value.lock().unwrap() = new_value;
                     }
                 }
@@ -132,10 +190,11 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             .write()
             .unwrap()
             .push(WeakSignalRefSync::new(&new_signal));
+
         result_new_signal
     }
 
-    pub fn comap<F, U>(&self, f: F) -> SignalSync<'a, U>
+    pub fn contramap<F, U>(&self, f: F) -> SignalSync<'a, U>
     where
         F: Fn(&U) -> T + Send + Sync + 'a,
         U: Default + Send + Sync + 'a,
@@ -170,6 +229,14 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             .push(WeakSignalRefSync::new(self));
 
         result_new_signal
+    }
+
+    pub fn comap<F, U>(&self, f: F) -> SignalSync<'a, U>
+    where
+        F: Fn(&U) -> T + Send + Sync + 'a,
+        U: Default + Send + Sync + 'a,
+    {
+        self.contramap(f)
     }
 
     pub fn promap<F, G, U>(&self, f: F, g: G) -> SignalSync<'a, U>
@@ -241,11 +308,30 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
-    pub fn with<S>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
+    pub fn combine<S>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
     where
         S: LiftableSync<'a>,
         S::Inner: Clone + Send + Sync + 'a,
         T: Clone,
+    {
+        self.combine_ref::<S, WeakRefStrategySync>(another)
+    }
+
+    pub fn and<S>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
+    where
+        S: LiftableSync<'a>,
+        S::Inner: Clone + Send + Sync + 'a,
+        T: Clone,
+    {
+        self.combine_ref::<S, StrongRefStrategySync>(another)
+    }
+
+    fn combine_ref<S, St: RefStrategySync<'a>>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
+    where
+        S: LiftableSync<'a>,
+        S::Inner: Clone + Send + Sync + 'a,
+        T: Clone,
+        St: 'a,
     {
         let another = another.as_ref();
         let new_signal = SignalSync::new((
@@ -253,29 +339,32 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             another.0.value.lock().unwrap().clone(),
         ));
         let result_new_signal = new_signal.clone();
-        let new_signal_weak = Arc::downgrade(&new_signal.0);
-        let source_for_closure_self = Arc::downgrade(&self.0);
-        let source_for_closure_another = Arc::downgrade(&another.0);
+
+        let new_signal_ref = St::new_ref(&new_signal);
+        let source_self_ref = St::new_ref(self);
 
         let react_fn_self = Box::new(move || {
-            if let Some(new_sig) = new_signal_weak.upgrade() {
+            if let Some(new_sig) = St::upgrade_ref(&new_signal_ref) {
                 if !new_sig.explicitly_modified.load(Ordering::Acquire) {
-                    if let Some(source) = source_for_closure_self.upgrade() {
+                    if let Some(source) = St::upgrade_ref(&source_self_ref) {
                         new_sig.value.lock().unwrap().0 = source.value.lock().unwrap().clone();
                     }
                 }
             }
         });
-        let new_signal_weak_2 = Arc::downgrade(&new_signal.0);
+
+        let new_signal_ref_2 = St::new_ref(&new_signal);
+        let source_another_ref_2 = St::new_ref(another);
         let react_fn_another = Box::new(move || {
-            if let Some(new_sig) = new_signal_weak_2.upgrade() {
+            if let Some(new_sig) = St::upgrade_ref(&new_signal_ref_2) {
                 if !new_sig.explicitly_modified.load(Ordering::Acquire) {
-                    if let Some(source) = source_for_closure_another.upgrade() {
+                    if let Some(source) = St::upgrade_ref(&source_another_ref_2) {
                         new_sig.value.lock().unwrap().1 = source.value.lock().unwrap().clone();
                     }
                 }
             }
         });
+
         self.0.react_fns.write().unwrap().push(react_fn_self);
         another.0.react_fns.write().unwrap().push(react_fn_another);
         self.0
@@ -297,6 +386,26 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         S: LiftableSync<'a, Inner = T>,
         T: Clone,
     {
+        self.extend_ref::<S, WeakRefStrategySync>(others)
+    }
+
+    pub fn follow<S>(&self, others: impl IntoIterator<Item = S>) -> SignalSync<'a, Vec<T>>
+    where
+        S: LiftableSync<'a, Inner = T>,
+        T: Clone,
+    {
+        self.extend_ref::<S, StrongRefStrategySync>(others)
+    }
+
+    fn extend_ref<S, St: RefStrategySync<'a>>(
+        &self,
+        others: impl IntoIterator<Item = S>,
+    ) -> SignalSync<'a, Vec<T>>
+    where
+        S: LiftableSync<'a, Inner = T>,
+        T: Clone,
+        St: 'a,
+    {
         let others_signals: Vec<SignalSync<'a, T>> =
             others.into_iter().map(|s| s.as_ref().clone()).collect();
 
@@ -312,13 +421,13 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             .chain(others_signals.iter())
             .enumerate()
             .for_each(|(index, signal)| {
-                let new_signal_weak = Arc::downgrade(&new_signal.0);
-                let source_for_closure = Arc::downgrade(&signal.0);
+                let new_signal_ref = St::new_ref(&new_signal);
+                let source_ref = St::new_ref(signal);
 
                 let react_fn = Box::new(move || {
-                    if let Some(new_sig) = new_signal_weak.upgrade() {
+                    if let Some(new_sig) = St::upgrade_ref(&new_signal_ref) {
                         if !new_sig.explicitly_modified.load(Ordering::Acquire) {
-                            if let Some(source) = source_for_closure.upgrade() {
+                            if let Some(source) = St::upgrade_ref(&source_ref) {
                                 new_sig.value.lock().unwrap()[index] =
                                     source.value.lock().unwrap().clone();
                             }
@@ -338,6 +447,33 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
+    pub fn depend(&self, dependency: &SignalSync<'a, T>)
+    where
+        T: Clone,
+    {
+        let self_weak = Arc::downgrade(&self.0);
+        let dependency_weak = Arc::downgrade(&dependency.0);
+
+        let react_fn = Box::new(move || {
+            if let Some(dep) = dependency_weak.upgrade() {
+                if let Some(target) = self_weak.upgrade() {
+                    if !target.explicitly_modified.load(Ordering::Acquire) {
+                        let dep_value = dep.value.lock().unwrap().clone();
+                        *target.value.lock().unwrap() = dep_value;
+                    }
+                }
+            }
+        });
+
+        dependency.0.react_fns.write().unwrap().push(react_fn);
+        dependency
+            .0
+            .successors
+            .write()
+            .unwrap()
+            .push(WeakSignalRefSync::new(self));
+    }
+
     pub(crate) fn modify(&self, f: impl FnOnce(&mut T)) {
         let mut value = self.0.value.lock().unwrap();
         f(&mut value);
@@ -351,15 +487,12 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     where
         F: FnMut(&dyn SignalExtSync<'a>),
     {
-        // Collect live references and execute callbacks within the read lock scope
         let signals_to_process: Vec<_> = {
             let mut refs_write = refs.write().unwrap();
             refs_write.retain(|s| s.is_alive());
-            // Clone references while holding write lock to avoid iterator invalidation
             refs_write.iter().filter_map(|s| s.upgrade()).collect()
         };
 
-        // Execute callbacks outside of any lock
         for signal in signals_to_process {
             callback(&*signal);
         }
@@ -496,11 +629,12 @@ mod tests {
     }
 
     #[test]
-    fn test_signal_sync_with() {
+    fn test_signal_sync_combine() {
         let a = SignalSync::new(0);
         let b = a.map(|x| x * 2);
-        let ab = a.with(&b);
-        let _ab = ab.map(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
+        let _ab = a
+            .and(&b)
+            .map(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
         (a.send(5), a.send(100));
     }
 
@@ -520,5 +654,21 @@ mod tests {
         source2.send(200);
         println!("--- Sending to source1 and source2 ---");
         (source1.send(300), source2.send(400));
+    }
+
+    #[test]
+    fn test_depend_sync() {
+        let a = SignalSync::new(10);
+        let b = SignalSync::new(10);
+        let c = SignalSync::new(10);
+
+        let _observer_a = a.map(|x| println!("a changed: {}", x));
+        let _observer_b = b.map(|x| println!("b changed: {}", x));
+        let _observer_c = c.map(|x| println!("c changed: {}", x));
+
+        c.depend(&b);
+        b.depend(&a);
+
+        (a.send(42), b.send(88));
     }
 }
