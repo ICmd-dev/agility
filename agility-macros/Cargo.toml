@@ -2,7 +2,7 @@
 name = "agility-macros"
 version = "0.1.0"
 edition = "2024"
-authors = ["Agility Contributors"]
+authors = ["Dexer Matters"]
 license = "MIT OR Apache-2.0"
 description = "Procedural macros for the Agility reactive programming library"
 repository = "https://github.com/ICmd-dev/agility"
