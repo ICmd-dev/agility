@@ -38,7 +38,6 @@ pub struct Pipeline<I, O: Clone> {
     next_stages: Arc<Mutex<Vec<NextStage<O>>>>,
     processing_thread: thread::Thread,
     busy: Arc<AtomicBool>,
-    child_busy: Option<Arc<AtomicBool>>,
 }
 
 impl<I, O: Clone> Pipeline<I, O> {
@@ -67,7 +66,6 @@ impl<I, O: Clone> Pipeline<I, O> {
             next_stages,
             processing_thread: thread_rx.recv().unwrap(),
             busy,
-            child_busy: None,
         }
     }
 
@@ -82,7 +80,6 @@ impl<I, O: Clone> Pipeline<I, O> {
             next_stages: next.next_stages,
             processing_thread: self.processing_thread.clone(),
             busy: self.busy.clone(),
-            child_busy: Some(next.busy),
         }
     }
 
@@ -96,14 +93,6 @@ impl<I, O: Clone> Pipeline<I, O> {
         let res = self.sender.send(None);
         self.processing_thread.unpark();
         res
-    }
-
-    pub fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst)
-            || self
-                .child_busy
-                .as_ref()
-                .map_or(false, |b| b.load(Ordering::SeqCst))
     }
 
     pub fn get_busy_flag(&self) -> Arc<AtomicBool> {

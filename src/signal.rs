@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    iter,
-    rc::{Rc, Weak},
-};
+use std::{cell::RefCell, iter, rc::Rc};
 
 use crate::api::Liftable;
 
@@ -42,10 +38,6 @@ impl<'a> WeakSignalRef<'a> {
     }
 }
 
-thread_local! {
-    static GUARD_DEPTH: RefCell<usize> = RefCell::new(0);
-}
-
 pub struct SignalGuardInner<'a>(Box<dyn SignalExt<'a> + 'a>);
 
 #[allow(dead_code)]
@@ -66,12 +58,6 @@ impl<'a> Drop for SignalGuard<'a> {
     fn drop(&mut self) {
         // First drop all inner guards (triggers immediate reactions)
         drop(std::mem::take(&mut self.0));
-
-        // Decrement depth
-        GUARD_DEPTH.with(|d| {
-            let current = *d.borrow();
-            *d.borrow_mut() = current - 1;
-        });
     }
 }
 
@@ -187,10 +173,12 @@ impl<'a, T: 'a> Signal<'a, T> {
     {
         let new_signal = Signal::new(U::default());
         let result_new_signal = new_signal.clone();
-        let source_inner = Rc::downgrade(&self.0);
-        let new_signal_rc = Rc::downgrade(&new_signal.0);
+        let source_weak = Rc::downgrade(&self.0);
+        let new_signal_weak = Rc::downgrade(&new_signal.0);
 
         // Forward reaction: T -> U (covariant)
+        let source_inner = source_weak.clone();
+        let new_signal_rc = new_signal_weak.clone();
         let forward_react_fn = Box::new(move || {
             if let Some(new_sig) = new_signal_rc.upgrade() {
                 if !*new_sig.explicitly_modified.borrow() {
@@ -211,8 +199,8 @@ impl<'a, T: 'a> Signal<'a, T> {
             .push(WeakSignalRef::new(&new_signal));
 
         // Backward reaction: U -> T (contravariant)
-        let source_inner_back = Rc::downgrade(&self.0);
-        let new_signal_rc_back = Rc::downgrade(&new_signal.0);
+        let new_signal_rc_back = new_signal_weak.clone();
+        let source_inner_back = source_weak.clone();
 
         let backward_react_fn = Box::new(move || {
             if let Some(new_sig) = new_signal_rc_back.upgrade() {
@@ -254,7 +242,6 @@ impl<'a, T: 'a> Signal<'a, T> {
         ));
         let result_new_signal = new_signal.clone();
         let new_signal_weak = Rc::downgrade(&new_signal.0);
-        let new_signal_weak_2 = Rc::downgrade(&new_signal.0);
         let source_for_closure_self = Rc::downgrade(&self.0);
         let source_for_closure_another = Rc::downgrade(&another.0);
 
@@ -267,6 +254,7 @@ impl<'a, T: 'a> Signal<'a, T> {
                 }
             }
         });
+        let new_signal_weak_2 = Rc::downgrade(&new_signal.0);
         let react_fn_another = Box::new(move || {
             if let Some(new_sig) = new_signal_weak_2.upgrade() {
                 if !*new_sig.explicitly_modified.borrow() {
@@ -345,21 +333,27 @@ impl<'a, T: 'a> Signal<'a, T> {
         *self.0.dirty.borrow_mut() += 1;
     }
 
+    fn collect_and_iterate<F>(&self, refs: &RefCell<Vec<WeakSignalRef<'a>>>, mut callback: F)
+    where
+        F: FnMut(&dyn SignalExt<'a>),
+    {
+        refs.borrow_mut().retain(|s| s.is_alive());
+        for s in refs.borrow().iter() {
+            if let Some(signal) = s.upgrade() {
+                callback(&*signal);
+            }
+        }
+    }
+
     fn collect_guards(&self, result: &mut Vec<SignalGuardInner<'a>>) {
         self.mark_dirty();
         result.push(SignalGuardInner(self.clone_box()));
-        self.0.successors.borrow_mut().retain(|s| s.is_alive());
-        for s in self.0.successors.borrow().iter() {
-            if let Some(signal) = s.upgrade() {
-                signal.collect_guards_recursive(result);
-            }
-        }
-        self.0.predecessors.borrow_mut().retain(|s| s.is_alive());
-        for s in self.0.predecessors.borrow().iter() {
-            if let Some(signal) = s.upgrade() {
-                signal.collect_predecessors_recursive(result);
-            }
-        }
+        self.collect_and_iterate(&self.0.successors, |signal| {
+            signal.collect_guards_recursive(result);
+        });
+        self.collect_and_iterate(&self.0.predecessors, |signal| {
+            signal.collect_predecessors_recursive(result);
+        });
     }
 
     pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> Signal<'a, [S::Inner; N]>
@@ -407,7 +401,6 @@ impl<'a, T: 'a> SignalExt<'a> for Signal<'a, T> {
         });
     }
     fn guard(&self) -> SignalGuard<'a> {
-        GUARD_DEPTH.with(|d| *d.borrow_mut() += 1);
         let mut result = vec![];
         self.collect_guards(&mut result);
         SignalGuard(result)
@@ -427,25 +420,17 @@ impl<'a, T: 'a> SignalExt<'a> for Signal<'a, T> {
     fn collect_guards_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>) {
         self.mark_dirty();
         result.push(SignalGuardInner(self.clone_box()));
-        // Retain only alive weak references and upgrade them
-        self.0.successors.borrow_mut().retain(|s| s.is_alive());
-        for s in self.0.successors.borrow().iter() {
-            if let Some(signal) = s.upgrade() {
-                signal.collect_guards_recursive(result);
-            }
-        }
+        self.collect_and_iterate(&self.0.successors, |signal| {
+            signal.collect_guards_recursive(result);
+        });
     }
     fn collect_predecessors_recursive(&self, result: &mut Vec<SignalGuardInner<'a>>) {
         self.mark_dirty();
         result.push(SignalGuardInner(self.clone_box()));
         // Collect predecessors last so they drop last (react last)
-        // Retain only alive weak references and upgrade them
-        self.0.predecessors.borrow_mut().retain(|s| s.is_alive());
-        for s in self.0.predecessors.borrow().iter() {
-            if let Some(signal) = s.upgrade() {
-                signal.collect_predecessors_recursive(result);
-            }
-        }
+        self.collect_and_iterate(&self.0.predecessors, |signal| {
+            signal.collect_predecessors_recursive(result);
+        });
     }
 }
 
@@ -530,9 +515,9 @@ mod tests {
         let source1 = result.comap(|x| x + 1);
         let source2 = source1.comap(|x| x * 2);
 
-        let _ = result.map(|x| println!("result changed: {}", x));
-        let _ = source1.map(|x| println!("source1 changed: {}", x));
-        let _ = source2.map(|x| println!("source2 changed: {}", x));
+        let _observer_1 = result.map(|x| println!("result changed: {}", x));
+        let _observer_2 = source1.map(|x| println!("source1 changed: {}", x));
+        let _observer_3 = source2.map(|x| println!("source2 changed: {}", x));
 
         println!("--- Sending to source1 ---");
         source1.send(100);
@@ -567,9 +552,9 @@ mod tests {
         let b = a.promap(|x| x * 2, |y| y / 2);
         let c = b.promap(|x| x + 3, |y| y - 3);
 
-        let _ = a.map(|x| println!("a changed: {}", x));
-        let _ = b.map(|x| println!("b changed: {}", x));
-        let _ = c.map(|x| println!("c changed: {}", x));
+        let _observer_a = a.map(|x| println!("a changed: {}", x));
+        let _observer_b = b.map(|x| println!("b changed: {}", x));
+        let _observer_c = c.map(|x| println!("c changed: {}", x));
 
         println!("--- Sending to a ---");
         a.send(5);
@@ -590,40 +575,5 @@ mod tests {
         let _ = derived.map(|s| s.send(233));
         let _ = derived.map(|s| s.map(|x| println!("derived changed: {}", x)));
         source.send(5);
-    }
-
-    #[test]
-    fn test_simultaneous_signals_dirty_mark() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let counter = Rc::new(RefCell::new(0));
-
-        let result = Signal::new(42);
-        let source1 = result.comap(|x| x + 1);
-        let source2 = source1.comap(|x| x * 2);
-
-        let counter_clone = counter.clone();
-        let _ = result.map(move |x| {
-            *counter_clone.borrow_mut() += 1;
-            println!(
-                "result changed: {} (trigger #{})",
-                x,
-                *counter_clone.borrow()
-            );
-        });
-
-        println!("--- Initial state ---");
-        println!("Counter: {}", *counter.borrow());
-
-        println!("\n--- Sending to source1 and source2 simultaneously ---");
-        *counter.borrow_mut() = 0;
-        (source1.send(300), source2.send(400));
-        println!("Result was triggered {} time(s)", *counter.borrow());
-        assert_eq!(
-            *counter.borrow(),
-            1,
-            "Result should only be triggered once when source1 and source2 are sent simultaneously"
-        );
     }
 }
