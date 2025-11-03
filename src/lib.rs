@@ -1,6 +1,8 @@
 pub mod api;
 pub mod concurrent;
 pub mod signal;
+pub mod signal_sync;
+pub mod signals;
 
 pub use agility_macros::*;
 
@@ -10,8 +12,11 @@ pub fn add(left: u64, right: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use agility_macros::LiftSync;
+
     use crate::Lift;
     use crate::signal::Signal;
+    use crate::signal_sync::SignalSync;
 
     #[test]
     fn test_lift_macro() {
@@ -36,23 +41,23 @@ mod tests {
 
     #[test]
     fn test_lift_macro_reactivity() {
-        #[derive(Clone, Lift)]
-        struct Point<'a, A: 'a> {
-            x: Signal<'a, i32>,
-            y: Signal<'a, i32>,
+        #[derive(Clone, LiftSync)]
+        struct Point<'a, A: 'a + Send + Sync> {
+            x: SignalSync<'a, i32>,
+            y: SignalSync<'a, i32>,
             label: A,
         }
 
         let point = Point {
-            x: Signal::new(10),
-            y: Signal::new(20),
+            x: SignalSync::new(10),
+            y: SignalSync::new(20),
             label: "Origin",
         };
 
         // From Point to Signal<_Point>
         let lifted = point.clone().lift();
 
-        lifted.map(|inner| {
+        let _observer = lifted.map(|inner| {
             println!("Point {}: ({}, {})", inner.label, inner.x, inner.y);
         });
 
