@@ -12,11 +12,15 @@ pub fn add(left: u64, right: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use agility_macros::LiftSync;
 
     use crate::Lift;
     use crate::signal::Signal;
     use crate::signal_sync::SignalSync;
+    use crate::signals::clock_tick;
 
     #[test]
     fn test_lift_macro() {
@@ -69,5 +73,18 @@ mod tests {
             y: 75,
             label: "Modified",
         });
+    }
+
+    #[test]
+    fn test_listener() {
+        let clock_signal = clock_tick(Duration::from_millis(500), Duration::from_secs(10));
+        let clock_signal2 = clock_tick(Duration::from_millis(250), Duration::from_secs(5));
+
+        let combined_signal = clock_signal.combine(&clock_signal2);
+        combined_signal.with(|(tick1, tick2)| {
+            println!("Tick1:\t{}, Tick2:\t{}", tick1, tick2);
+        });
+
+        thread::sleep(Duration::from_secs(12));
     }
 }

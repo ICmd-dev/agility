@@ -2,7 +2,7 @@ use std::{cell::RefCell, iter, rc::Rc};
 
 use crate::api::Liftable;
 
-pub trait SignalExt<'a> {
+pub(crate) trait SignalExt<'a> {
     fn react(&self);
     fn guard(&self) -> SignalGuard<'a>;
     fn decrease_dirty(&self);
@@ -13,8 +13,41 @@ pub trait SignalExt<'a> {
     fn reset_explicitly_modified(&self);
 }
 
-// Helper struct to hold weak references that can be upgraded
-pub struct WeakSignalRef<'a> {
+pub(crate) trait RefStrategy<'a> {
+    type Ref<T: 'a>: 'a;
+    fn new_ref<T: 'a>(inner: &Rc<SignalInner<'a, T>>) -> Self::Ref<T>;
+    fn upgrade<T: 'a>(ref_: &Self::Ref<T>) -> Option<Rc<SignalInner<'a, T>>>;
+}
+
+pub(crate) struct WeakRefStrategy;
+
+impl<'a> RefStrategy<'a> for WeakRefStrategy {
+    type Ref<T: 'a> = std::rc::Weak<SignalInner<'a, T>>;
+
+    fn new_ref<T: 'a>(inner: &Rc<SignalInner<'a, T>>) -> Self::Ref<T> {
+        Rc::downgrade(inner)
+    }
+
+    fn upgrade<T: 'a>(ref_: &Self::Ref<T>) -> Option<Rc<SignalInner<'a, T>>> {
+        ref_.upgrade()
+    }
+}
+
+pub(crate) struct StrongRefStrategy;
+
+impl<'a> RefStrategy<'a> for StrongRefStrategy {
+    type Ref<T: 'a> = Rc<SignalInner<'a, T>>;
+
+    fn new_ref<T: 'a>(inner: &Rc<SignalInner<'a, T>>) -> Self::Ref<T> {
+        inner.clone()
+    }
+
+    fn upgrade<T: 'a>(ref_: &Self::Ref<T>) -> Option<Rc<SignalInner<'a, T>>> {
+        Some(ref_.clone())
+    }
+}
+
+pub(crate) struct WeakSignalRef<'a> {
     upgrade: Box<dyn Fn() -> Option<Box<dyn SignalExt<'a> + 'a>> + 'a>,
 }
 
@@ -38,8 +71,10 @@ impl<'a> WeakSignalRef<'a> {
     }
 }
 
+/// The inner part of a signal guard
 pub struct SignalGuardInner<'a>(Box<dyn SignalExt<'a> + 'a>);
 
+/// Signal guard that triggers reactions on drop
 #[allow(dead_code)]
 #[allow(unused_must_use)]
 pub struct SignalGuard<'a>(Vec<SignalGuardInner<'a>>);
@@ -61,6 +96,7 @@ impl<'a> Drop for SignalGuard<'a> {
     }
 }
 
+/// The inner data of a signal
 pub struct SignalInner<'a, T> {
     pub(crate) value: RefCell<T>,
     pub(crate) react_fns: RefCell<Vec<Box<dyn Fn() + 'a>>>,
@@ -70,9 +106,11 @@ pub struct SignalInner<'a, T> {
     pub(crate) explicitly_modified: RefCell<bool>,
 }
 
+/// Reactive signal type
 pub struct Signal<'a, T>(pub(crate) Rc<SignalInner<'a, T>>);
 
 impl<'a, T: 'a> Signal<'a, T> {
+    /// Create a new signal with the given initial value
     pub fn new(initial: T) -> Self {
         let inner = Rc::new(SignalInner {
             value: RefCell::new(initial),
@@ -85,12 +123,14 @@ impl<'a, T: 'a> Signal<'a, T> {
         Signal(inner)
     }
 
+    /// Send a new value to the signal
     pub fn send(&self, new_value: T) -> SignalGuard<'a> {
         self.modify(|v| *v = new_value);
         *self.0.explicitly_modified.borrow_mut() = true;
         self.guard()
     }
 
+    /// Send a modification to the signal
     pub fn send_with<F>(&self, f: F) -> SignalGuard<'a>
     where
         F: FnOnce(&mut T),
@@ -99,22 +139,38 @@ impl<'a, T: 'a> Signal<'a, T> {
         self.guard()
     }
 
+    /// Map the signal to a new signal
     pub fn map<U: 'a, F>(&self, f: F) -> Signal<'a, U>
+    where
+        F: Fn(&T) -> U + 'a,
+    {
+        self.map_ref::<U, F, WeakRefStrategy>(f)
+    }
+
+    /// Map the signal to a new signal with strong references
+    pub fn with<U: 'a, F>(&self, f: F) -> Signal<'a, U>
+    where
+        F: Fn(&T) -> U + 'a,
+    {
+        self.map_ref::<U, F, StrongRefStrategy>(f)
+    }
+
+    fn map_ref<U: 'a, F, S: RefStrategy<'a>>(&self, f: F) -> Signal<'a, U>
     where
         F: Fn(&T) -> U + 'a,
     {
         let new_signal = Signal::new(f(&self.0.value.borrow()));
         let result_new_signal = new_signal.clone();
-        let new_signal_for_react = Rc::downgrade(&new_signal.0);
-        let source_for_closure = Rc::downgrade(&self.0);
+
+        let new_signal_ref = S::new_ref(&new_signal.0);
+        let source_ref = S::new_ref(&self.0);
 
         let react_fn = Box::new(move || {
-            // Only update if the signal wasn't explicitly modified
-            if let Some(new_sig) = new_signal_for_react.upgrade() {
-                if !*new_sig.explicitly_modified.borrow() {
-                    if let Some(source) = source_for_closure.upgrade() {
-                        let new_value = f(&source.value.borrow());
-                        *new_sig.value.borrow_mut() = new_value;
+            if let Some(new_sig_inner) = S::upgrade(&new_signal_ref) {
+                if !*new_sig_inner.explicitly_modified.borrow() {
+                    if let Some(src_inner) = S::upgrade(&source_ref) {
+                        let new_value = f(&src_inner.value.borrow());
+                        *new_sig_inner.value.borrow_mut() = new_value;
                     }
                 }
             }
@@ -125,10 +181,12 @@ impl<'a, T: 'a> Signal<'a, T> {
             .successors
             .borrow_mut()
             .push(WeakSignalRef::new(&new_signal));
+
         result_new_signal
     }
 
-    pub fn comap<F, U>(&self, f: F) -> Signal<'a, U>
+    /// Map the signal contravariantly to a new signal
+    pub fn contramap<F, U>(&self, f: F) -> Signal<'a, U>
     where
         F: Fn(&U) -> T + 'a,
         U: Default + 'a,
@@ -154,8 +212,6 @@ impl<'a, T: 'a> Signal<'a, T> {
         });
         new_signal.0.react_fns.borrow_mut().push(react_fn);
 
-        // Register self (source/result) as a predecessor of new_signal (backward dependency)
-        // When new_signal changes, it propagates backward to self
         new_signal
             .0
             .predecessors
@@ -165,6 +221,7 @@ impl<'a, T: 'a> Signal<'a, T> {
         result_new_signal
     }
 
+    /// Map the signal bidirectionally to a new signal
     pub fn promap<F, G, U>(&self, f: F, g: G) -> Signal<'a, U>
     where
         F: Fn(&T) -> U + 'a,
@@ -229,9 +286,31 @@ impl<'a, T: 'a> Signal<'a, T> {
         result_new_signal
     }
 
-    pub fn with<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
+    /// Combine two signals into one
+    pub fn combine<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
     where
         S: Liftable<'a>,
+        S::Inner: Clone + 'a,
+        T: Clone,
+    {
+        self.combine_ref::<S, WeakRefStrategy>(another)
+    }
+
+    /// Combine two signals into one with strong references
+    pub fn and<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
+    where
+        S: Liftable<'a>,
+        S::Inner: Clone + 'a,
+        T: Clone,
+    {
+        self.combine_ref::<S, StrongRefStrategy>(another)
+    }
+
+    fn combine_ref<S: Liftable<'a>, Strat: RefStrategy<'a>>(
+        &self,
+        another: S,
+    ) -> Signal<'a, (T, S::Inner)>
+    where
         S::Inner: Clone + 'a,
         T: Clone,
     {
@@ -241,29 +320,35 @@ impl<'a, T: 'a> Signal<'a, T> {
             another.0.value.borrow().clone(),
         ));
         let result_new_signal = new_signal.clone();
-        let new_signal_weak = Rc::downgrade(&new_signal.0);
-        let source_for_closure_self = Rc::downgrade(&self.0);
-        let source_for_closure_another = Rc::downgrade(&another.0);
+
+        // Self reaction
+        let new_signal_ref = Strat::new_ref(&new_signal.0);
+        let self_ref = Strat::new_ref(&self.0);
 
         let react_fn_self = Box::new(move || {
-            if let Some(new_sig) = new_signal_weak.upgrade() {
+            if let Some(new_sig) = Strat::upgrade(&new_signal_ref) {
                 if !*new_sig.explicitly_modified.borrow() {
-                    if let Some(source) = source_for_closure_self.upgrade() {
-                        new_sig.value.borrow_mut().0 = source.value.borrow().clone();
+                    if let Some(src) = Strat::upgrade(&self_ref) {
+                        new_sig.value.borrow_mut().0 = src.value.borrow().clone();
                     }
                 }
             }
         });
-        let new_signal_weak_2 = Rc::downgrade(&new_signal.0);
+
+        // Another reaction
+        let new_signal_ref_2 = Strat::new_ref(&new_signal.0);
+        let another_ref = Strat::new_ref(&another.0);
+
         let react_fn_another = Box::new(move || {
-            if let Some(new_sig) = new_signal_weak_2.upgrade() {
+            if let Some(new_sig) = Strat::upgrade(&new_signal_ref_2) {
                 if !*new_sig.explicitly_modified.borrow() {
-                    if let Some(source) = source_for_closure_another.upgrade() {
-                        new_sig.value.borrow_mut().1 = source.value.borrow().clone();
+                    if let Some(src) = Strat::upgrade(&another_ref) {
+                        new_sig.value.borrow_mut().1 = src.value.borrow().clone();
                     }
                 }
             }
         });
+
         self.0.react_fns.borrow_mut().push(react_fn_self);
         another.0.react_fns.borrow_mut().push(react_fn_another);
         self.0
@@ -278,13 +363,32 @@ impl<'a, T: 'a> Signal<'a, T> {
         result_new_signal
     }
 
+    /// Extend the signal into a vector of signals
     pub fn extend<S>(&self, others: impl IntoIterator<Item = S>) -> Signal<'a, Vec<T>>
     where
         S: Liftable<'a, Inner = T>,
         T: Clone,
     {
-        // Collect the iterator into owned Signal clones so we don't keep
-        // references to temporary `S` values that would be dropped.
+        self.extend_ref::<S, WeakRefStrategy>(others)
+    }
+
+    /// Extend the signal into a vector of signals with strong references
+    pub fn follow<S>(&self, others: impl IntoIterator<Item = S>) -> Signal<'a, Vec<T>>
+    where
+        S: Liftable<'a, Inner = T>,
+        T: Clone,
+    {
+        self.extend_ref::<S, StrongRefStrategy>(others)
+    }
+
+    fn extend_ref<S, Strat: RefStrategy<'a>>(
+        &self,
+        others: impl IntoIterator<Item = S>,
+    ) -> Signal<'a, Vec<T>>
+    where
+        S: Liftable<'a, Inner = T>,
+        T: Clone + 'a,
+    {
         let others_signals: Vec<Signal<'a, T>> =
             others.into_iter().map(|s| s.as_ref().clone()).collect();
 
@@ -300,14 +404,14 @@ impl<'a, T: 'a> Signal<'a, T> {
             .chain(others_signals.iter())
             .enumerate()
             .for_each(|(index, signal)| {
-                let new_signal_weak = Rc::downgrade(&new_signal.0);
-                let source_for_closure = Rc::downgrade(&signal.0);
+                let new_signal_ref = Strat::new_ref(&new_signal.0);
+                let source_ref = Strat::new_ref(&signal.0);
 
                 let react_fn = Box::new(move || {
-                    if let Some(new_sig) = new_signal_weak.upgrade() {
+                    if let Some(new_sig) = Strat::upgrade(&new_signal_ref) {
                         if !*new_sig.explicitly_modified.borrow() {
-                            if let Some(source) = source_for_closure.upgrade() {
-                                new_sig.value.borrow_mut()[index] = source.value.borrow().clone();
+                            if let Some(src) = Strat::upgrade(&source_ref) {
+                                new_sig.value.borrow_mut()[index] = src.value.borrow().clone();
                             }
                         }
                     }
@@ -322,6 +426,33 @@ impl<'a, T: 'a> Signal<'a, T> {
             });
 
         result_new_signal
+    }
+
+    /// Let this signal depend on another signal
+    pub fn depend(&self, dependency: &Signal<'a, T>)
+    where
+        T: Clone,
+    {
+        let self_weak = Rc::downgrade(&self.0);
+        let dependency_weak = Rc::downgrade(&dependency.0);
+
+        let react_fn = Box::new(move || {
+            if let Some(dep) = dependency_weak.upgrade() {
+                if let Some(target) = self_weak.upgrade() {
+                    if !*target.explicitly_modified.borrow() {
+                        let dep_value = dep.value.borrow().clone();
+                        *target.value.borrow_mut() = dep_value;
+                    }
+                }
+            }
+        });
+
+        dependency.0.react_fns.borrow_mut().push(react_fn);
+        dependency
+            .0
+            .successors
+            .borrow_mut()
+            .push(WeakSignalRef::new(self));
     }
 
     pub(crate) fn modify(&self, f: impl FnOnce(&mut T)) {
@@ -356,6 +487,7 @@ impl<'a, T: 'a> Signal<'a, T> {
         });
     }
 
+    /// Lift an array of liftable items into a signal of an array
     pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> Signal<'a, [S::Inner; N]>
     where
         S: Liftable<'a>,
@@ -448,6 +580,7 @@ impl<'a, T> AsRef<Signal<'a, T>> for Signal<'a, T> {
 
 #[cfg(test)]
 mod tests {
+
     use crate::api::LiftInto;
 
     use super::*;
@@ -472,7 +605,7 @@ mod tests {
     fn test_signal2() {
         let a = Signal::new(0);
         let b = a.map(|x| x * 2);
-        let ab = a.with(&b);
+        let ab = a.combine(&b);
         let _ab = ab.map(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
         (a.send(5), a.send(100));
     }
@@ -495,7 +628,7 @@ mod tests {
         let _abc =
             abc.map(|[x, y, z]| println!("d changed: {} + {} + {} = {}", x, y, z, x + y + z));
         let d = Signal::new(0);
-        let abcd = abc.with(&d);
+        let abcd = abc.combine(&d);
         let _abcd = abcd.map(|numbers| {
             println!(
                 "e changed: {} + {} + {} + {} = {}",
@@ -512,8 +645,8 @@ mod tests {
     #[test]
     fn test_signal5() {
         let result = Signal::new(42);
-        let source1 = result.comap(|x| x + 1);
-        let source2 = source1.comap(|x| x * 2);
+        let source1 = result.contramap(|x| x + 1);
+        let source2 = source1.contramap(|x| x * 2);
 
         let _observer_1 = result.map(|x| println!("result changed: {}", x));
         let _observer_2 = source1.map(|x| println!("source1 changed: {}", x));
@@ -575,5 +708,48 @@ mod tests {
         let _ = derived.map(|s| s.send(233));
         let _ = derived.map(|s| s.map(|x| println!("derived changed: {}", x)));
         source.send(5);
+    }
+
+    #[test]
+    fn test_depend() {
+        let a = Signal::new(10);
+        let b = Signal::new(10);
+        let c = Signal::new(10);
+
+        let _observer_a = a.map(|x| println!("a changed: {}", x));
+        let _observer_b = b.map(|x| println!("b changed: {}", x));
+        let _observer_c = c.map(|x| println!("c changed: {}", x));
+
+        c.depend(&b.with(|x| x * 2));
+        b.depend(&a);
+
+        a.send(42);
+    }
+
+    #[test]
+    fn test_depend2() {
+        let a = Signal::new(10);
+        let b = a.map(|x| *x);
+        let c = b.map(|x| *x);
+
+        let _observer_a = a.map(|x| println!("a changed: {}", x));
+        let _observer_b = b.map(|x| println!("b changed: {}", x));
+        let _observer_c = c.map(|x| println!("c changed: {}", x));
+
+        (a.send(42), b.send(88));
+    }
+
+    #[test]
+    fn test_with() {
+        let a = Signal::new(10);
+        let b = a.with(|x| x * 2);
+
+        a.with(|x| println!("a changed: {}", x));
+        b.with(|x| println!("b changed: {}", x));
+
+        println!("--- Sending to a ---");
+        a.send(5);
+        println!("--- Sending to a again ---");
+        a.send(20);
     }
 }
