@@ -5,9 +5,23 @@ members = [".", "agility-macros"]
 name = "agility"
 version = "0.1.0"
 edition = "2024"
+authors = ["Dexer Matters"]
+license = "MIT OR Apache-2.0"
+description = "A powerful and elegant reactive programming library for Rust, inspired by category theory"
+repository = "https://github.com/ICmd-dev/agility"
+documentation = "https://docs.rs/agility"
+homepage = "https://github.com/ICmd-dev/agility"
+readme = "README.md"
+keywords = ["reactive", "signals", "frp", "async", "category-theory"]
+categories = ["asynchronous", "data-structures", "concurrency"]
+exclude = [
+    ".github/",
+    "examples/",
+    "tests/trybuild/",
+]
 
 [dependencies]
-agility-macros = { path = "agility-macros" }
+agility-macros = { version = "0.1.0", path = "agility-macros" }
 
 [dev-dependencies]
 trybuild = "1.0"

@@ -4,7 +4,11 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{DeriveInput, Fields, GenericArgument, PathArguments, Type, TypePath, parse_macro_input};
 
-/// Helper function to check if a type is Signal<'a, T> and extract the inner type T
+/// Helper function to check if a type is `Signal<'a, T>` and extract the inner type `T`.
+///
+/// This is used by the `#[derive(Lift)]` macro generator to detect struct fields
+/// that are reactive `Signal` types and to obtain their wrapped inner types so
+/// the generated inner struct contains the unwrapped types.
 fn extract_signal_inner_type(ty: &Type) -> Option<&Type> {
     if let Type::Path(TypePath { path, .. }) = ty {
         // Get the last segment of the path (e.g., "Signal" from "crate::signal::Signal")
@@ -30,7 +34,11 @@ fn extract_signal_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-/// Helper function to check if a type is SignalSync<'a, T> and extract the inner type T
+/// Helper function to check if a type is `SignalSync<'a, T>` and extract the inner type `T`.
+///
+/// This is used by the `#[derive(LiftSync)]` macro generator to detect struct fields
+/// that are thread-safe reactive `SignalSync` types and to obtain their wrapped inner
+/// types so the generated inner struct contains the unwrapped types.
 fn extract_signal_sync_inner_type(ty: &Type) -> Option<&Type> {
     if let Type::Path(TypePath { path, .. }) = ty {
         // Get the last segment of the path (e.g., "SignalSync" from "crate::signal_sync::SignalSync")
@@ -56,6 +64,28 @@ fn extract_signal_sync_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
+/// Derive macro to lift a struct into a reactive `Signal`.
+///
+/// Applying `#[derive(Lift)]` to a struct generates an inner unwrapped struct and
+/// a `lift(self)` method that produces a `crate::signal::Signal<'a, _Inner>` where
+/// any fields of type `Signal<'a, T>` are replaced by their inner `T` in the
+/// generated inner struct. The generated `lift` method wires up reactions so that
+/// changes to any signal fields propagate into the resulting lifted `Signal`.
+///
+/// Example:
+/// ```rust
+/// use crate::signal::Signal;
+///
+/// #[derive(Lift)]
+/// struct Example<'a> {
+///     a: Signal<'a, i32>,
+///     b: String,
+/// }
+///
+/// let example = Example { a: Signal::new(1), b: "hi".to_string() };
+/// let lifted = example.lift(); // Signal<'a, _Example>
+/// lifted.with(|inner| println!("a = {}", inner.a));
+/// ```
 #[proc_macro_derive(Lift)]
 pub fn derive_lift(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -198,6 +228,28 @@ pub fn derive_lift(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Derive macro to lift a struct into a thread-safe reactive `SignalSync`.
+///
+/// Applying `#[derive(LiftSync)]` to a struct generates an inner unwrapped struct and
+/// a `lift(self)` method that produces a `crate::signal_sync::SignalSync<'a, _Inner>` where
+/// any fields of type `SignalSync<'a, T>` are replaced by their inner `T` in the
+/// generated inner struct. The generated `lift` method wires up thread-safe reactions
+/// so that changes to any signal fields propagate into the resulting lifted `SignalSync`.
+///
+/// Example:
+/// ```rust
+/// use crate::signal_sync::SignalSync;
+///
+/// #[derive(LiftSync)]
+/// struct ExampleSync<'a> {
+///     a: SignalSync<'a, i32>,
+///     b: String,
+/// }
+///
+/// let example = ExampleSync { a: SignalSync::new(1), b: "hi".to_string() };
+/// let lifted = example.lift(); // SignalSync<'a, _ExampleSync>
+/// lifted.with(|inner| println!("a = {}", inner.a));
+/// ```
 #[proc_macro_derive(LiftSync)]
 pub fn derive_lift_sync(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

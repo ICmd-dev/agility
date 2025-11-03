@@ -106,7 +106,7 @@ pub struct SignalInner<'a, T> {
     pub(crate) explicitly_modified: RefCell<bool>,
 }
 
-/// Reactive signal type
+/// Signal representing a reactive value
 pub struct Signal<'a, T>(pub(crate) Rc<SignalInner<'a, T>>);
 
 impl<'a, T: 'a> Signal<'a, T> {
@@ -124,6 +124,21 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Send a new value to the signal
+    ///
+    /// This will replace the current value of the signal with the new value.
+    /// The signals that depend on this signal will be notified and updated accordingly.
+    ///
+    /// It returns a `SignalGuard` that ensures reactions are processed when dropped and
+    /// prevents premature reactions during multiple sends. (Batch updates)
+    /// # Example
+    /// ```rust
+    /// let signal = Signal::new(0);
+    /// signal.send(42); // sets the signal's value to 42
+    ///
+    /// signal.with(|v| println!("Signal value: {}", v));
+    /// (signal.send(66), signal.send(100));
+    /// // sets the signal's value to 100 and prints "Signal value: 100" only once
+    /// ```
     pub fn send(&self, new_value: T) -> SignalGuard<'a> {
         self.modify(|v| *v = new_value);
         *self.0.explicitly_modified.borrow_mut() = true;
@@ -131,6 +146,12 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Send a modification to the signal
+    ///
+    /// This will apply the provided function to modify the current value of the signal.
+    /// The signals that depend on this signal will be notified and updated accordingly.
+    ///
+    /// It returns a `SignalGuard` that ensures reactions are processed when dropped and
+    /// prevents premature reactions during multiple sends. (Batch updates)
     pub fn send_with<F>(&self, f: F) -> SignalGuard<'a>
     where
         F: FnOnce(&mut T),
@@ -140,6 +161,17 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Map the signal to a new signal
+    ///
+    /// This creates a new signal that depends on the current signal.
+    /// Changes to the source signal will propagate to the new signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// let _observer = b.map(|x| println!("b changed: {}", x));
+    /// a.send(5); // prints "b changed: 10"
+    /// ```
     pub fn map<U: 'a, F>(&self, f: F) -> Signal<'a, U>
     where
         F: Fn(&T) -> U + 'a,
@@ -148,6 +180,18 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Map the signal to a new signal with strong references
+    ///
+    /// This creates a new signal that depends on the current signal.
+    /// Changes to the source signal will propagate to the new signal.
+    /// This mapping uses strong references.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// b.with(|x| println!("b changed: {}", x));
+    /// a.send(5); // prints "b changed: 10"
+    /// ```
     pub fn with<U: 'a, F>(&self, f: F) -> Signal<'a, U>
     where
         F: Fn(&T) -> U + 'a,
@@ -186,6 +230,20 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Map the signal contravariantly to a new signal
+    ///
+    /// This creates a new signal that the current signal depends on.
+    /// Changes to the new signal will propagate back to the original signal.
+    /// It is inspired by the concept of contravariant functors in category theory.
+    ///
+    /// # Example
+    /// ```rust
+    /// let result = Signal::new(42);
+    /// let source = result.contramap(|x| x * 2);
+    /// result.with(|x| println!("result changed: {}", x));
+    /// source.with(|x| println!("source changed: {}", x));
+    /// source.send(100);
+    /// // prints "source changed: 100" and "result changed: 50"
+    /// ```
     pub fn contramap<F, U>(&self, f: F) -> Signal<'a, U>
     where
         F: Fn(&U) -> T + 'a,
@@ -222,6 +280,21 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Map the signal bidirectionally to a new signal
+    ///
+    /// This creates a new signal that depends on the current signal,
+    /// and the current signal also depends on the new signal.
+    /// Changes to either signal will propagate to the other signal.
+    /// It is inspired by the concept of profunctors in category theory.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(10);
+    /// let b = a.promap(|x| x * 2, |y| y / 2);
+    /// a.with(|x| println!("a changed: {}", x));
+    /// b.with(|x| println!("b changed: {}", x));
+    /// a.send(5); // prints "a changed: 5" and "b changed: 10"
+    /// b.send(50); // prints "b changed: 50" and "a changed: 25"
+    /// ```
     pub fn promap<F, G, U>(&self, f: F, g: G) -> Signal<'a, U>
     where
         F: Fn(&T) -> U + 'a,
@@ -287,6 +360,18 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Combine two signals into one
+    ///
+    /// This combines two signals into a new signal that holds a tuple of their values.
+    /// Changes to either signal will propagate to the new combined signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// let ab = a.combine(&b);
+    /// ab.with(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
+    /// a.send(5); // prints "c changed: 5 + 10 = 15"
+    /// ```
     pub fn combine<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
     where
         S: Liftable<'a>,
@@ -297,6 +382,18 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Combine two signals into one with strong references
+    ///
+    /// This combines two signals into a new signal that holds a tuple of their values.
+    /// Changes to either signal will propagate to the new combined signal.
+    /// This combination uses strong references.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// a.and(&b).with(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
+    /// a.send(5); // prints "c changed: 5 + 10 = 15"
+    /// ```
     pub fn and<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
     where
         S: Liftable<'a>,
@@ -363,7 +460,21 @@ impl<'a, T: 'a> Signal<'a, T> {
         result_new_signal
     }
 
-    /// Extend the signal into a vector of signals
+    /// Extend the signal with a vector of signals
+    ///
+    /// This creates a new signal that depends on the current signal and the provided signals.
+    /// Changes to any of the source signals will propagate to the new signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(1);
+    /// let b = Signal::new(2);
+    /// let c = Signal::new(3);
+    /// let d = a.extend(vec![b, c]);
+    /// d.with(|values| println!("d changed: {:?}", values));
+    /// a.send(10); // prints "d changed: [10, 2, 3]"
+    /// (b.send(20), c.send(30)); // prints "d changed: [10, 20, 30]"
+    /// ```
     pub fn extend<S>(&self, others: impl IntoIterator<Item = S>) -> Signal<'a, Vec<T>>
     where
         S: Liftable<'a, Inner = T>,
@@ -372,7 +483,21 @@ impl<'a, T: 'a> Signal<'a, T> {
         self.extend_ref::<S, WeakRefStrategy>(others)
     }
 
-    /// Extend the signal into a vector of signals with strong references
+    /// Extend the signal with a vector of signals with strong references
+    ///
+    /// This creates a new signal that depends on the current signal and the provided signals.
+    /// Changes to any of the source signals will propagate to the new signal.
+    /// It uses strong references.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(1);
+    /// let b = Signal::new(2);
+    /// let c = Signal::new(3);
+    /// a.follow(vec![b, c]).with(|values| println!("d changed: {:?}", values));
+    /// a.send(10); // prints "d changed: [10, 2, 3]"
+    /// (b.send(20), c.send(30)); // prints "d changed: [10, 20, 30]"
+    /// ```
     pub fn follow<S>(&self, others: impl IntoIterator<Item = S>) -> Signal<'a, Vec<T>>
     where
         S: Liftable<'a, Inner = T>,
@@ -429,6 +554,26 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Let this signal depend on another signal
+    ///
+    /// This synchronizes the value of this signal with the value of the dependency signal.
+    /// Whenever the dependency signal changes, this signal will be updated to match its value.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(1);
+    /// let b = Signal::new(2);
+    /// a.depend(&b);
+    /// a.with(|v| println!("a changed: {}", v));
+    /// b.send(3); // prints "a changed: 3"
+    /// ```
+    ///
+    /// The example above is analogous to:
+    /// ```rust
+    /// let a = Signal::new(1);
+    /// let b = a.map(|v| *v);
+    /// b.with(|v| println!("b changed: {}", v));
+    /// a.send(3); // prints "b changed: 3"
+    /// ```
     pub fn depend(&self, dependency: &Signal<'a, T>)
     where
         T: Clone,
@@ -488,6 +633,19 @@ impl<'a, T: 'a> Signal<'a, T> {
     }
 
     /// Lift an array of liftable items into a signal of an array
+    ///
+    /// This creates a new signal that depends on the provided liftable items.
+    /// Changes to any of the source signals will propagate to the new signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = Signal::new(1);
+    /// let b = Signal::new(2);
+    /// let c = Signal::new(3);
+    /// let abc = Signal::lift_from_array([a, b, c]);
+    /// abc.with(|values| println!("abc changed: {:?}", values));
+    /// (a.send(10), b.send(20), c.send(30)); // prints "abc changed: [10, 20, 30]"
+    /// ```
     pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> Signal<'a, [S::Inner; N]>
     where
         S: Liftable<'a>,

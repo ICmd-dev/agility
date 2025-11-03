@@ -3,21 +3,41 @@ use crate::signal_sync::SignalSync;
 
 trait Mutable {}
 
+/// Trait for lifting collections of signals into a single signal.
+/// For example, lifting (Signal<A>, Signal<B>) into Signal<(A, B)>
 pub trait LiftInto<T> {
+    /// Lift the collection into a single signal
+    ///
+    /// # Examples
+    /// ```rust
+    /// let a = Signal::new(1);
+    /// let b = Signal::new(2);
+    /// let lifted = [a, b].lift();
+    /// lifted.with(|[x, y]| println!("Lifted: {}, {}", x, y));
+    /// a.send(10); // prints "Lifted: 10, 2"
+    /// b.send(20); // prints "Lifted: 10, 20"
+    /// ```
     fn lift(self) -> T;
 }
 
+/// Trait for lifting collections of thread-safe signals into a single thread-safe signal.
+/// For example, lifting (SignalSync<A>, SignalSync<B>) into SignalSync<(A, B)>
 pub trait LiftIntoSync<T> {
+    /// Lift the collection into a single thread-safe signal
     fn lift(self) -> T;
 }
 
+/// Trait for signal-like types that can be lifted
 pub trait Liftable<'a> {
     type Inner;
+    /// Get a reference to the underlying signal
     fn as_ref(&self) -> &Signal<'a, Self::Inner>;
 }
 
+/// Trait for thread-safe signal-like types that can be lifted
 pub trait LiftableSync<'a> {
     type Inner;
+    /// Get a reference to the underlying thread-safe signal
     fn as_ref(&self) -> &SignalSync<'a, Self::Inner>;
 }
 

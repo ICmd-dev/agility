@@ -8,7 +8,7 @@ use std::{
 
 use crate::api::LiftableSync;
 
-pub trait SignalExtSync<'a>: Send + Sync {
+pub(crate) trait SignalExtSync<'a>: Send + Sync {
     fn react(&self);
     fn guard(&self) -> SignalGuardSync<'a>;
     fn decrease_dirty(&self);
@@ -87,8 +87,10 @@ impl<'a> WeakSignalRefSync<'a> {
     }
 }
 
+/// The inner part of the signal (thread-safe version)
 pub struct SignalGuardInnerSync<'a>(Box<dyn SignalExtSync<'a> + 'a>);
 
+/// Guard that ensures reactions are processed when dropped (thread-safe version)
 #[allow(dead_code)]
 #[allow(unused_must_use)]
 pub struct SignalGuardSync<'a>(Vec<SignalGuardInnerSync<'a>>);
@@ -110,6 +112,7 @@ impl<'a> Drop for SignalGuardSync<'a> {
     }
 }
 
+/// The inner part of the signal (thread-safe version)
 pub struct SignalInnerSync<'a, T> {
     pub(crate) value: Mutex<T>,
     pub(crate) react_fns: RwLock<Vec<Box<dyn Fn() + Send + Sync + 'a>>>,
@@ -119,9 +122,11 @@ pub struct SignalInnerSync<'a, T> {
     pub(crate) explicitly_modified: AtomicBool,
 }
 
+/// A signal type that is thread-safe
 pub struct SignalSync<'a, T>(pub(crate) Arc<SignalInnerSync<'a, T>>);
 
 impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
+    /// Create a new signal with the given initial value
     pub fn new(initial: T) -> Self {
         let inner = Arc::new(SignalInnerSync {
             value: Mutex::new(initial),
@@ -134,13 +139,36 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         SignalSync(inner)
     }
 
+    /// Send a new value to the signal
+    ///
+    /// This will replace the current value of the signal with the new value.
+    /// The signals that depend on this signal will be notified and updated accordingly.
+    ///
+    /// It returns a `SignalGuardSync` that ensures reactions are processed when dropped and
+    /// prevents premature reactions during multiple sends. (Batch updates)
+    /// # Example
+    /// ```rust
+    /// let signal = SignalSync::new(0);
+    /// signal.send(42); // sets the signal's value to 42
+    ///
+    /// signal.with(|v| println!("Signal value: {}", v));
+    /// (signal.send(66), signal.send(100));
+    /// // sets the signal's value to 100 and prints "Signal value: 100" only once
+    /// ```
     pub fn send(&self, new_value: T) -> SignalGuardSync<'a> {
         self.modify(|v| *v = new_value);
         self.0.explicitly_modified.store(true, Ordering::Release);
         self.guard()
     }
 
-    pub fn send_combine<F>(&self, f: F) -> SignalGuardSync<'a>
+    /// Send a modification to the signal
+    ///
+    /// This will apply the provided function to modify the current value of the signal.
+    /// The signals that depend on this signal will be notified and updated accordingly.
+    ///
+    /// It returns a `SignalGuardSync` that ensures reactions are processed when dropped and
+    /// prevents premature reactions during multiple sends. (Batch updates)
+    pub fn send_with<F>(&self, f: F) -> SignalGuardSync<'a>
     where
         F: FnOnce(&mut T),
     {
@@ -148,6 +176,18 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         self.guard()
     }
 
+    /// Map the signal to a new signal
+    ///
+    /// This creates a new signal that depends on the current signal.
+    /// Changes to the source signal will propagate to the new signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// let _observer = b.map(|x| println!("b changed: {}", x));
+    /// a.send(5); // prints "b changed: 10"
+    /// ```
     pub fn map<U: Send + Sync + 'a, F>(&self, f: F) -> SignalSync<'a, U>
     where
         F: Fn(&T) -> U + Send + Sync + 'a,
@@ -155,6 +195,19 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         self.map_ref::<U, F, WeakRefStrategySync>(f)
     }
 
+    /// Map the signal to a new signal with strong references
+    ///
+    /// This creates a new signal that depends on the current signal.
+    /// Changes to the source signal will propagate to the new signal.
+    /// This mapping uses strong references.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// b.with(|x| println!("b changed: {}", x));
+    /// a.send(5); // prints "b changed: 10"
+    /// ```
     pub fn with<U: Send + Sync + 'a, F>(&self, f: F) -> SignalSync<'a, U>
     where
         F: Fn(&T) -> U + Send + Sync + 'a,
@@ -194,6 +247,21 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
+    /// Map the signal contravariantly to a new signal
+    ///
+    /// This creates a new signal that the current signal depends on.
+    /// Changes to the new signal will propagate back to the original signal.
+    /// It is inspired by the concept of contravariant functors in category theory.
+    ///
+    /// # Example
+    /// ```rust
+    /// let result = SignalSync::new(42);
+    /// let source = result.contramap(|x| x * 2);
+    /// result.with(|x| println!("result changed: {}", x));
+    /// source.with(|x| println!("source changed: {}", x));
+    /// source.send(100);
+    /// // prints "source changed: 100" and "result changed: 50"
+    /// ```
     pub fn contramap<F, U>(&self, f: F) -> SignalSync<'a, U>
     where
         F: Fn(&U) -> T + Send + Sync + 'a,
@@ -231,6 +299,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
+    /// Alias for `contramap` (preserves naming similarity with non-sync API)
     pub fn comap<F, U>(&self, f: F) -> SignalSync<'a, U>
     where
         F: Fn(&U) -> T + Send + Sync + 'a,
@@ -239,6 +308,22 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         self.contramap(f)
     }
 
+    /// Map the signal bidirectionally to a new signal
+    ///
+    /// This creates a new signal that depends on the current signal,
+    /// and the current signal also depends on the new signal.
+    /// Changes to either signal will propagate to the other signal.
+    /// It is inspired by the concept of profunctors in category theory.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(10);
+    /// let b = a.promap(|x| x * 2, |y| y / 2);
+    /// a.with(|x| println!("a changed: {}", x));
+    /// b.with(|x| println!("b changed: {}", x));
+    /// a.send(5); // prints "a changed: 5" and "b changed: 10"
+    /// b.send(50); // prints "b changed: 50" and "a changed: 25"
+    /// ```
     pub fn promap<F, G, U>(&self, f: F, g: G) -> SignalSync<'a, U>
     where
         F: Fn(&T) -> U + Send + Sync + 'a,
@@ -308,6 +393,19 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
+    /// Combine two signals into one
+    ///
+    /// This combines two signals into a new signal that holds a tuple of their values.
+    /// Changes to either signal will propagate to the new combined signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// let ab = a.combine(&b);
+    /// ab.with(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
+    /// a.send(5); // prints "c changed: 5 + 10 = 15"
+    /// ```
     pub fn combine<S>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
     where
         S: LiftableSync<'a>,
@@ -317,6 +415,19 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         self.combine_ref::<S, WeakRefStrategySync>(another)
     }
 
+    /// Combine two signals into one with strong references
+    ///
+    /// This combines two signals into a new signal that holds a tuple of their values.
+    /// Changes to either signal will propagate to the new combined signal.
+    /// This combination uses strong references.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(10);
+    /// let b = a.map(|x| x * 2);
+    /// a.and(&b).with(|(x, y)| println!("c changed: {} + {} = {}", x, y, x + y));
+    /// a.send(5); // prints "c changed: 5 + 10 = 15"
+    /// ```
     pub fn and<S>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
     where
         S: LiftableSync<'a>,
@@ -381,6 +492,21 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
+    /// Extend the signal with a vector of signals
+    ///
+    /// This creates a new signal that depends on the current signal and the provided signals.
+    /// Changes to any of the source signals will propagate to the new signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(1);
+    /// let b = SignalSync::new(2);
+    /// let c = SignalSync::new(3);
+    /// let d = a.extend(vec![b, c]);
+    /// d.with(|values| println!("d changed: {:?}", values));
+    /// a.send(10); // prints "d changed: [10, 2, 3]"
+    /// (b.send(20), c.send(30)); // prints "d changed: [10, 20, 30]"
+    /// ```
     pub fn extend<S>(&self, others: impl IntoIterator<Item = S>) -> SignalSync<'a, Vec<T>>
     where
         S: LiftableSync<'a, Inner = T>,
@@ -389,6 +515,21 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         self.extend_ref::<S, WeakRefStrategySync>(others)
     }
 
+    /// Extend the signal with a vector of signals with strong references
+    ///
+    /// This creates a new signal that depends on the current signal and the provided signals.
+    /// Changes to any of the source signals will propagate to the new signal.
+    /// It uses strong references.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(1);
+    /// let b = SignalSync::new(2);
+    /// let c = SignalSync::new(3);
+    /// a.follow(vec![b, c]).with(|values| println!("d changed: {:?}", values));
+    /// a.send(10); // prints "d changed: [10, 2, 3]"
+    /// (b.send(20), c.send(30)); // prints "d changed: [10, 20, 30]"
+    /// ```
     pub fn follow<S>(&self, others: impl IntoIterator<Item = S>) -> SignalSync<'a, Vec<T>>
     where
         S: LiftableSync<'a, Inner = T>,
@@ -447,6 +588,27 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
+    /// Let this signal depend on another signal
+    ///
+    /// This synchronizes the value of this signal with the value of the dependency signal.
+    /// Whenever the dependency signal changes, this signal will be updated to match its value.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(1);
+    /// let b = SignalSync::new(2);
+    /// a.depend(&b);
+    /// a.with(|v| println!("a changed: {}", v));
+    /// b.send(3); // prints "a changed: 3"
+    /// ```
+    ///
+    /// The example above is analogous to:
+    /// ```rust
+    /// let a = SignalSync::new(1);
+    /// let b = a.map(|v| *v);
+    /// b.with(|v| println!("b changed: {}", v));
+    /// a.send(3); // prints "b changed: 3"
+    /// ```
     pub fn depend(&self, dependency: &SignalSync<'a, T>)
     where
         T: Clone,
@@ -474,6 +636,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             .push(WeakSignalRefSync::new(self));
     }
 
+    /// Apply a modification function to the stored value (thread-safe)
     pub(crate) fn modify(&self, f: impl FnOnce(&mut T)) {
         let mut value = self.0.value.lock().unwrap();
         f(&mut value);
@@ -509,6 +672,20 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         });
     }
 
+    /// Lift an array of liftable items into a signal of an array
+    ///
+    /// This creates a new signal that depends on the provided liftable items.
+    /// Changes to any of the source signals will propagate to the new signal.
+    ///
+    /// # Example
+    /// ```rust
+    /// let a = SignalSync::new(1);
+    /// let b = SignalSync::new(2);
+    /// let c = SignalSync::new(3);
+    /// let abc = SignalSync::lift_from_array([a, b, c]);
+    /// abc.with(|values| println!("abc changed: {:?}", values));
+    /// (a.send(10), b.send(20), c.send(30)); // prints "abc changed: [10, 20, 30]"
+    /// ```
     pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> SignalSync<'a, [S::Inner; N]>
     where
         S: LiftableSync<'a>,
