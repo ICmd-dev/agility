@@ -80,6 +80,7 @@ pub struct SignalGuardInner<'a>(Box<dyn SignalExt<'a> + 'a>);
 pub struct SignalGuard<'a>(Vec<SignalGuardInner<'a>>);
 
 impl<'a> SignalGuard<'a> {
+    /// Combine two signal guards into one
     pub fn and(mut self, mut other: SignalGuard<'a>) -> SignalGuard<'a> {
         self.0.append(&mut other.0);
         self
