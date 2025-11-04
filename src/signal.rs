@@ -79,6 +79,13 @@ pub struct SignalGuardInner<'a>(Box<dyn SignalExt<'a> + 'a>);
 #[allow(unused_must_use)]
 pub struct SignalGuard<'a>(Vec<SignalGuardInner<'a>>);
 
+impl<'a> SignalGuard<'a> {
+    pub fn and(mut self, mut other: SignalGuard<'a>) -> SignalGuard<'a> {
+        self.0.append(&mut other.0);
+        self
+    }
+}
+
 impl<'a> Drop for SignalGuardInner<'a> {
     fn drop(&mut self) {
         self.0.decrease_dirty();
@@ -121,6 +128,14 @@ impl<'a, T: 'a> Signal<'a, T> {
             explicitly_modified: RefCell::new(false),
         });
         Signal(inner)
+    }
+
+    /// Helper: Temporarily take value without cloning using MaybeUninit
+    #[inline]
+    fn take_value<U>(cell: &RefCell<U>) -> U {
+        let mut temp = unsafe { std::mem::MaybeUninit::<U>::uninit().assume_init() };
+        std::mem::swap(&mut *cell.borrow_mut(), &mut temp);
+        temp
     }
 
     /// Send a new value to the signal
@@ -379,8 +394,8 @@ impl<'a, T: 'a> Signal<'a, T> {
     pub fn combine<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
     where
         S: Liftable<'a>,
-        S::Inner: Clone + 'a,
-        T: Clone,
+        S::Inner: 'a,
+        T: 'a,
     {
         self.combine_ref::<S, WeakRefStrategy>(another)
     }
@@ -401,8 +416,8 @@ impl<'a, T: 'a> Signal<'a, T> {
     pub fn and<S>(&self, another: S) -> Signal<'a, (T, S::Inner)>
     where
         S: Liftable<'a>,
-        S::Inner: Clone + 'a,
-        T: Clone,
+        S::Inner: 'a,
+        T: 'a,
     {
         self.combine_ref::<S, StrongRefStrategy>(another)
     }
@@ -412,55 +427,70 @@ impl<'a, T: 'a> Signal<'a, T> {
         another: S,
     ) -> Signal<'a, (T, S::Inner)>
     where
-        S::Inner: Clone + 'a,
-        T: Clone,
+        S::Inner: 'a,
+        T: 'a,
     {
         let another = another.as_ref();
-        let new_signal = Signal::new((
-            self.0.value.borrow().clone(),
-            another.0.value.borrow().clone(),
-        ));
+
+        // Take values temporarily, create signal, restore values
+        let temp_val_0 = Self::take_value(&self.0.value);
+        let temp_val_1 = Self::take_value(&another.0.value);
+        let new_signal = Signal::new((temp_val_0, temp_val_1));
+        std::mem::swap(
+            &mut *self.0.value.borrow_mut(),
+            &mut new_signal.0.value.borrow_mut().0,
+        );
+        std::mem::swap(
+            &mut *another.0.value.borrow_mut(),
+            &mut new_signal.0.value.borrow_mut().1,
+        );
+
         let result_new_signal = new_signal.clone();
 
-        // Self reaction
+        // Register reaction for first source
         let new_signal_ref = Strat::new_ref(&new_signal.0);
         let self_ref = Strat::new_ref(&self.0);
-
         let react_fn_self = Box::new(move || {
-            if let Some(new_sig) = Strat::upgrade(&new_signal_ref) {
+            if let (Some(new_sig), Some(src)) =
+                (Strat::upgrade(&new_signal_ref), Strat::upgrade(&self_ref))
+            {
                 if !*new_sig.explicitly_modified.borrow() {
-                    if let Some(src) = Strat::upgrade(&self_ref) {
-                        new_sig.value.borrow_mut().0 = src.value.borrow().clone();
-                    }
+                    std::mem::swap(
+                        &mut *src.value.borrow_mut(),
+                        &mut new_sig.value.borrow_mut().0,
+                    );
                 }
             }
         });
-
-        // Another reaction
-        let new_signal_ref_2 = Strat::new_ref(&new_signal.0);
-        let another_ref = Strat::new_ref(&another.0);
-
-        let react_fn_another = Box::new(move || {
-            if let Some(new_sig) = Strat::upgrade(&new_signal_ref_2) {
-                if !*new_sig.explicitly_modified.borrow() {
-                    if let Some(src) = Strat::upgrade(&another_ref) {
-                        new_sig.value.borrow_mut().1 = src.value.borrow().clone();
-                    }
-                }
-            }
-        });
-
         self.0.react_fns.borrow_mut().push(react_fn_self);
-        another.0.react_fns.borrow_mut().push(react_fn_another);
         self.0
             .successors
             .borrow_mut()
             .push(WeakSignalRef::new(&result_new_signal));
+
+        // Register reaction for second source
+        let new_signal_ref_2 = Strat::new_ref(&new_signal.0);
+        let another_ref = Strat::new_ref(&another.0);
+        let react_fn_another = Box::new(move || {
+            if let (Some(new_sig), Some(src)) = (
+                Strat::upgrade(&new_signal_ref_2),
+                Strat::upgrade(&another_ref),
+            ) {
+                if !*new_sig.explicitly_modified.borrow() {
+                    std::mem::swap(
+                        &mut *src.value.borrow_mut(),
+                        &mut new_sig.value.borrow_mut().1,
+                    );
+                }
+            }
+        });
+        another.0.react_fns.borrow_mut().push(react_fn_another);
         another
             .0
             .successors
             .borrow_mut()
             .push(WeakSignalRef::new(&result_new_signal));
+
         result_new_signal
     }
 
@@ -482,7 +512,7 @@ impl<'a, T: 'a> Signal<'a, T> {
     pub fn extend<S>(&self, others: impl IntoIterator<Item = S>) -> Signal<'a, Vec<T>>
     where
         S: Liftable<'a, Inner = T>,
-        T: Clone,
+        T: 'a,
     {
         self.extend_ref::<S, WeakRefStrategy>(others)
     }
@@ -505,7 +535,7 @@ impl<'a, T: 'a> Signal<'a, T> {
     pub fn follow<S>(&self, others: impl IntoIterator<Item = S>) -> Signal<'a, Vec<T>>
     where
         S: Liftable<'a, Inner = T>,
-        T: Clone,
+        T: 'a,
     {
         self.extend_ref::<S, StrongRefStrategy>(others)
     }
@@ -516,17 +546,29 @@ impl<'a, T: 'a> Signal<'a, T> {
     ) -> Signal<'a, Vec<T>>
     where
         S: Liftable<'a, Inner = T>,
-        T: Clone + 'a,
+        T: 'a,
     {
         let others_signals: Vec<Signal<'a, T>> =
             others.into_iter().map(|s| s.as_ref().clone()).collect();
 
-        let new_signal: Signal<'a, Vec<T>> = Signal::new(
-            iter::once(self)
-                .chain(others_signals.iter())
-                .map(|s| s.0.value.borrow().clone())
-                .collect(),
-        );
+        // Collect values using take_value helper - no cloning!
+        let all_signals: Vec<&Signal<'a, T>> =
+            iter::once(self).chain(others_signals.iter()).collect();
+
+        let temp_values: Vec<T> = all_signals
+            .iter()
+            .map(|s| Self::take_value(&s.0.value))
+            .collect();
+        let new_signal: Signal<'a, Vec<T>> = Signal::new(temp_values);
+
+        // Restore original values by swapping back
+        for (index, signal) in all_signals.iter().enumerate() {
+            std::mem::swap(
+                &mut *signal.0.value.borrow_mut(),
+                &mut new_signal.0.value.borrow_mut()[index],
+            );
+        }
+
         let result_new_signal = new_signal.clone();
 
         iter::once(self)
@@ -540,7 +582,11 @@ impl<'a, T: 'a> Signal<'a, T> {
                     if let Some(new_sig) = Strat::upgrade(&new_signal_ref) {
                         if !*new_sig.explicitly_modified.borrow() {
                             if let Some(src) = Strat::upgrade(&source_ref) {
-                                new_sig.value.borrow_mut()[index] = src.value.borrow().clone();
+                                // Swap values instead of cloning (during reaction only)
+                                std::mem::swap(
+                                    &mut new_sig.value.borrow_mut()[index],
+                                    &mut *src.value.borrow_mut(),
+                                );
                             }
                         }
                     }
@@ -592,8 +638,11 @@ impl<'a, T: 'a> Signal<'a, T> {
             if let Some(dep) = dependency_weak.upgrade() {
                 if let Some(target) = self_weak.upgrade() {
                     if !*target.explicitly_modified.borrow() {
-                        let dep_value = dep.value.borrow().clone();
-                        *target.value.borrow_mut() = dep_value;
+                        // Swap values instead of cloning (during reaction only)
+                        std::mem::swap(
+                            &mut *target.value.borrow_mut(),
+                            &mut *dep.value.borrow_mut(),
+                        );
                     }
                 }
             }
@@ -657,13 +706,22 @@ impl<'a, T: 'a> Signal<'a, T> {
     pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> Signal<'a, [S::Inner; N]>
     where
         S: Liftable<'a>,
-        S::Inner: Clone + 'a,
+        S::Inner: 'a,
     {
         let signals: [Signal<'a, S::Inner>; N] = std::array::from_fn(|i| items[i].as_ref().clone());
 
-        let initial: [S::Inner; N] = std::array::from_fn(|i| signals[i].0.value.borrow().clone());
-
+        // Take values using helper - no cloning!
+        let initial: [S::Inner; N] = std::array::from_fn(|i| Self::take_value(&signals[i].0.value));
         let new_signal: Signal<'a, [S::Inner; N]> = Signal::new(initial);
+
+        // Restore original values by swapping back
+        for (index, signal) in signals.iter().enumerate() {
+            std::mem::swap(
+                &mut *signal.0.value.borrow_mut(),
+                &mut new_signal.0.value.borrow_mut()[index],
+            );
+        }
+
         let result_new_signal = new_signal.clone();
 
         for (index, signal) in signals.iter().enumerate() {
@@ -674,7 +732,11 @@ impl<'a, T: 'a> Signal<'a, T> {
                 if let Some(new_sig) = new_signal_weak.upgrade() {
                     if !*new_sig.explicitly_modified.borrow() {
                         if let Some(source) = source_for_closure.upgrade() {
-                            new_sig.value.borrow_mut()[index] = source.value.borrow().clone();
+                            // Swap instead of cloning (during reaction only)
+                            std::mem::swap(
+                                &mut new_sig.value.borrow_mut()[index],
+                                &mut *source.value.borrow_mut(),
+                            );
                         }
                     }
                 }
@@ -862,7 +924,7 @@ mod tests {
         println!("--- Sending to b ---");
         b.send(10);
         println!("--- Sending to a and c ---");
-        (a.send(20), c.send(50));
+        a.send(20).and(c.send(50));
         println!("--- Sending to b and c ---");
         (b.send(30), c.send(60));
     }

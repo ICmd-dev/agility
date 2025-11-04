@@ -95,6 +95,13 @@ pub struct SignalGuardInnerSync<'a>(Box<dyn SignalExtSync<'a> + 'a>);
 #[allow(unused_must_use)]
 pub struct SignalGuardSync<'a>(Vec<SignalGuardInnerSync<'a>>);
 
+impl<'a> SignalGuardSync<'a> {
+    pub fn and(mut self, mut other: SignalGuardSync<'a>) -> SignalGuardSync<'a> {
+        self.0.append(&mut other.0);
+        self
+    }
+}
+
 impl<'a> Drop for SignalGuardInnerSync<'a> {
     fn drop(&mut self) {
         self.0.decrease_dirty();
@@ -126,6 +133,13 @@ pub struct SignalInnerSync<'a, T> {
 pub struct SignalSync<'a, T>(pub(crate) Arc<SignalInnerSync<'a, T>>);
 
 impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
+    /// Helper: temporarily take a value from a Mutex using MaybeUninit swap
+    fn take_value<U>(mutex: &Mutex<U>) -> U {
+        let mut temp = unsafe { std::mem::MaybeUninit::<U>::uninit().assume_init() };
+        std::mem::swap(&mut *mutex.lock().unwrap(), &mut temp);
+        temp
+    }
+
     /// Create a new signal with the given initial value
     pub fn new(initial: T) -> Self {
         let inner = Arc::new(SignalInnerSync {
@@ -400,8 +414,8 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     pub fn combine<S>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
     where
         S: LiftableSync<'a>,
-        S::Inner: Clone + Send + Sync + 'a,
-        T: Clone,
+        S::Inner: Send + Sync + 'a,
+        T: Send + Sync,
     {
         self.combine_ref::<S, WeakRefStrategySync>(another)
     }
@@ -422,8 +436,8 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     pub fn and<S>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
     where
         S: LiftableSync<'a>,
-        S::Inner: Clone + Send + Sync + 'a,
-        T: Clone,
+        S::Inner: Send + Sync + 'a,
+        T: Send + Sync,
     {
         self.combine_ref::<S, StrongRefStrategySync>(another)
     }
@@ -431,15 +445,27 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     fn combine_ref<S, St: RefStrategySync<'a>>(&self, another: S) -> SignalSync<'a, (T, S::Inner)>
     where
         S: LiftableSync<'a>,
-        S::Inner: Clone + Send + Sync + 'a,
-        T: Clone,
+        S::Inner: Send + Sync + 'a,
+        T: Send + Sync,
         St: 'a,
     {
         let another = another.as_ref();
-        let new_signal = SignalSync::new((
-            self.0.value.lock().unwrap().clone(),
-            another.0.value.lock().unwrap().clone(),
-        ));
+
+        // Take values using helper - no cloning!
+        let temp_val_0 = Self::take_value(&self.0.value);
+        let temp_val_1 = Self::take_value(&another.0.value);
+        let new_signal = SignalSync::new((temp_val_0, temp_val_1));
+
+        // Restore original values by swapping back from the new signal
+        std::mem::swap(
+            &mut *self.0.value.lock().unwrap(),
+            &mut new_signal.0.value.lock().unwrap().0,
+        );
+        std::mem::swap(
+            &mut *another.0.value.lock().unwrap(),
+            &mut new_signal.0.value.lock().unwrap().1,
+        );
+
         let result_new_signal = new_signal.clone();
 
         let new_signal_ref = St::new_ref(&new_signal);
@@ -449,7 +475,11 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             if let Some(new_sig) = St::upgrade_ref(&new_signal_ref) {
                 if !new_sig.explicitly_modified.load(Ordering::Acquire) {
                     if let Some(source) = St::upgrade_ref(&source_self_ref) {
-                        new_sig.value.lock().unwrap().0 = source.value.lock().unwrap().clone();
+                        // Swap values instead of cloning (during reaction only)
+                        std::mem::swap(
+                            &mut *source.value.lock().unwrap(),
+                            &mut new_sig.value.lock().unwrap().0,
+                        );
                     }
                 }
             }
@@ -461,7 +491,11 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             if let Some(new_sig) = St::upgrade_ref(&new_signal_ref_2) {
                 if !new_sig.explicitly_modified.load(Ordering::Acquire) {
                     if let Some(source) = St::upgrade_ref(&source_another_ref_2) {
-                        new_sig.value.lock().unwrap().1 = source.value.lock().unwrap().clone();
+                        // Swap values instead of cloning (during reaction only)
+                        std::mem::swap(
+                            &mut *source.value.lock().unwrap(),
+                            &mut new_sig.value.lock().unwrap().1,
+                        );
                     }
                 }
             }
@@ -501,7 +535,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     pub fn extend<S>(&self, others: impl IntoIterator<Item = S>) -> SignalSync<'a, Vec<T>>
     where
         S: LiftableSync<'a, Inner = T>,
-        T: Clone,
+        T: Send + Sync,
     {
         self.extend_ref::<S, WeakRefStrategySync>(others)
     }
@@ -524,7 +558,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     pub fn follow<S>(&self, others: impl IntoIterator<Item = S>) -> SignalSync<'a, Vec<T>>
     where
         S: LiftableSync<'a, Inner = T>,
-        T: Clone,
+        T: Send + Sync,
     {
         self.extend_ref::<S, StrongRefStrategySync>(others)
     }
@@ -535,18 +569,29 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     ) -> SignalSync<'a, Vec<T>>
     where
         S: LiftableSync<'a, Inner = T>,
-        T: Clone,
+        T: Send + Sync,
         St: 'a,
     {
         let others_signals: Vec<SignalSync<'a, T>> =
             others.into_iter().map(|s| s.as_ref().clone()).collect();
 
-        let new_signal: SignalSync<'a, Vec<T>> = SignalSync::new(
-            iter::once(self)
-                .chain(others_signals.iter())
-                .map(|s| s.0.value.lock().unwrap().clone())
-                .collect(),
-        );
+        // Collect values using helper - no cloning!
+        let all_signals: Vec<&SignalSync<'a, T>> =
+            iter::once(self).chain(others_signals.iter()).collect();
+        let temp_values: Vec<T> = all_signals
+            .iter()
+            .map(|s| Self::take_value(&s.0.value))
+            .collect();
+        let new_signal: SignalSync<'a, Vec<T>> = SignalSync::new(temp_values);
+
+        // Restore original values by swapping back
+        for (index, signal) in all_signals.iter().enumerate() {
+            std::mem::swap(
+                &mut *signal.0.value.lock().unwrap(),
+                &mut new_signal.0.value.lock().unwrap()[index],
+            );
+        }
+
         let result_new_signal = new_signal.clone();
 
         iter::once(self)
@@ -560,8 +605,11 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
                     if let Some(new_sig) = St::upgrade_ref(&new_signal_ref) {
                         if !new_sig.explicitly_modified.load(Ordering::Acquire) {
                             if let Some(source) = St::upgrade_ref(&source_ref) {
-                                new_sig.value.lock().unwrap()[index] =
-                                    source.value.lock().unwrap().clone();
+                                // Swap values instead of cloning (during reaction only)
+                                std::mem::swap(
+                                    &mut new_sig.value.lock().unwrap()[index],
+                                    &mut *source.value.lock().unwrap(),
+                                );
                             }
                         }
                     }
@@ -605,7 +653,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     /// ```
     pub fn depend(&self, dependency: SignalSync<'a, T>) -> SignalSync<'a, T>
     where
-        T: Clone,
+        T: Default + Send + Sync,
     {
         let self_weak = Arc::downgrade(&self.0);
         let dependency_weak = Arc::downgrade(&dependency.0);
@@ -614,8 +662,11 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             if let Some(dep) = dependency_weak.upgrade() {
                 if let Some(target) = self_weak.upgrade() {
                     if !target.explicitly_modified.load(Ordering::Acquire) {
-                        let dep_value = dep.value.lock().unwrap().clone();
-                        *target.value.lock().unwrap() = dep_value;
+                        // Swap values instead of cloning
+                        std::mem::swap(
+                            &mut *target.value.lock().unwrap(),
+                            &mut *dep.value.lock().unwrap(),
+                        );
                     }
                 }
             }
@@ -684,15 +735,23 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     pub fn lift_from_array<S, const N: usize>(items: [S; N]) -> SignalSync<'a, [S::Inner; N]>
     where
         S: LiftableSync<'a>,
-        S::Inner: Clone + Send + Sync + 'a,
+        S::Inner: Send + Sync + 'a,
     {
         let signals: [SignalSync<'a, S::Inner>; N] =
             std::array::from_fn(|i| items[i].as_ref().clone());
 
-        let initial: [S::Inner; N] =
-            std::array::from_fn(|i| signals[i].0.value.lock().unwrap().clone());
-
+        // Take values using helper - no cloning!
+        let initial: [S::Inner; N] = std::array::from_fn(|i| Self::take_value(&signals[i].0.value));
         let new_signal: SignalSync<'a, [S::Inner; N]> = SignalSync::new(initial);
+
+        // Restore original values by swapping back
+        for (index, signal) in signals.iter().enumerate() {
+            std::mem::swap(
+                &mut *signal.0.value.lock().unwrap(),
+                &mut new_signal.0.value.lock().unwrap()[index],
+            );
+        }
+
         let result_new_signal = new_signal.clone();
 
         for (index, signal) in signals.iter().enumerate() {
@@ -703,8 +762,11 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
                 if let Some(new_sig) = new_signal_weak.upgrade() {
                     if !new_sig.explicitly_modified.load(Ordering::Acquire) {
                         if let Some(source) = source_for_closure.upgrade() {
-                            new_sig.value.lock().unwrap()[index] =
-                                source.value.lock().unwrap().clone();
+                            // Swap instead of cloning (during reaction only)
+                            std::mem::swap(
+                                &mut new_sig.value.lock().unwrap()[index],
+                                &mut *source.value.lock().unwrap(),
+                            );
                         }
                     }
                 }

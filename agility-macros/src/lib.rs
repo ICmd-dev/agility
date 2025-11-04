@@ -146,7 +146,11 @@ pub fn derive_lift(input: TokenStream) -> TokenStream {
                     if let Some(result_sig) = result_signal_weak.upgrade() {
                         if !*result_sig.explicitly_modified.borrow() {
                             if let Some(source) = source_for_closure.upgrade() {
-                                result_sig.value.borrow_mut().#field_name = source.value.borrow().clone();
+                                // Swap values instead of cloning
+                                std::mem::swap(
+                                    &mut *source.value.borrow_mut(),
+                                    &mut result_sig.value.borrow_mut().#field_name,
+                                );
                             }
                         }
                     }
@@ -158,11 +162,15 @@ pub fn derive_lift(input: TokenStream) -> TokenStream {
         }
     });
 
-    // Generate the inner struct initialization from main struct
+    // Generate the inner struct initialization from main struct (using swap - no clone!)
     let inner_from_main = signal_fields.iter().map(|field| {
         let field_name = &field.ident;
         quote! {
-            #field_name: instance.#field_name.0.value.borrow().clone()
+            #field_name: {
+                let mut temp = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                std::mem::swap(&mut *instance.#field_name.0.value.borrow_mut(), &mut temp);
+                temp
+            }
         }
     });
 
@@ -170,6 +178,17 @@ pub fn derive_lift(input: TokenStream) -> TokenStream {
         let field_name = &field.ident;
         quote! {
             #field_name: instance.#field_name.clone()
+        }
+    });
+
+    // Generate restore code for signal fields (swap back after creating result_signal)
+    let restore_values = signal_fields.iter().map(|field| {
+        let field_name = &field.ident;
+        quote! {
+            std::mem::swap(
+                &mut *instance.#field_name.0.value.borrow_mut(),
+                &mut result_signal.0.value.borrow_mut().#field_name,
+            );
         }
     });
 
@@ -217,6 +236,9 @@ pub fn derive_lift(input: TokenStream) -> TokenStream {
                 };
 
                 let result_signal = crate::signal::Signal::new(initial_inner);
+
+                // Restore original values by swapping back
+                #(#restore_values)*
 
                 #(#reactive_setup)*
 
@@ -310,7 +332,11 @@ pub fn derive_lift_sync(input: TokenStream) -> TokenStream {
                     if let Some(result_sig) = result_signal_weak.upgrade() {
                         if !result_sig.explicitly_modified.load(std::sync::atomic::Ordering::Acquire) {
                             if let Some(source) = source_for_closure.upgrade() {
-                                result_sig.value.lock().unwrap().#field_name = source.value.lock().unwrap().clone();
+                                // Swap values instead of cloning
+                                std::mem::swap(
+                                    &mut *source.value.lock().unwrap(),
+                                    &mut result_sig.value.lock().unwrap().#field_name,
+                                );
                             }
                         }
                     }
@@ -322,11 +348,15 @@ pub fn derive_lift_sync(input: TokenStream) -> TokenStream {
         }
     });
 
-    // Generate the inner struct initialization from main struct
+    // Generate the inner struct initialization from main struct (using swap - no clone!)
     let inner_from_main = signal_fields.iter().map(|field| {
         let field_name = &field.ident;
         quote! {
-            #field_name: instance.#field_name.0.value.lock().unwrap().clone()
+            #field_name: {
+                let mut temp = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                std::mem::swap(&mut *instance.#field_name.0.value.lock().unwrap(), &mut temp);
+                temp
+            }
         }
     });
 
@@ -334,6 +364,17 @@ pub fn derive_lift_sync(input: TokenStream) -> TokenStream {
         let field_name = &field.ident;
         quote! {
             #field_name: instance.#field_name.clone()
+        }
+    });
+
+    // Generate restore code for signal fields (swap back after creating result_signal)
+    let restore_values = signal_fields.iter().map(|field| {
+        let field_name = &field.ident;
+        quote! {
+            std::mem::swap(
+                &mut *instance.#field_name.0.value.lock().unwrap(),
+                &mut result_signal.0.value.lock().unwrap().#field_name,
+            );
         }
     });
 
@@ -381,6 +422,9 @@ pub fn derive_lift_sync(input: TokenStream) -> TokenStream {
                 };
 
                 let result_signal = crate::signal_sync::SignalSync::new(initial_inner);
+
+                // Restore original values by swapping back
+                #(#restore_values)*
 
                 #(#reactive_setup)*
 

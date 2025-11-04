@@ -75,8 +75,8 @@ impl<'a, S1, S2> LiftInto<Signal<'a, (S1::Inner, S2::Inner)>> for (S1, S2)
 where
     S1: Liftable<'a>,
     S2: Liftable<'a>,
-    S1::Inner: Clone + 'a,
-    S2::Inner: Clone + 'a,
+    S1::Inner: 'a,
+    S2::Inner: 'a,
 {
     fn lift(self) -> Signal<'a, (S1::Inner, S2::Inner)> {
         self.0.as_ref().combine(self.1.as_ref())
@@ -87,7 +87,7 @@ impl<'a, S, I> LiftInto<Signal<'a, Vec<S::Inner>>> for I
 where
     S: Liftable<'a>,
     I: IntoIterator<Item = S> + Mutable,
-    S::Inner: Clone + 'a,
+    S::Inner: 'a,
 {
     fn lift(self) -> Signal<'a, Vec<S::Inner>> {
         let mut items: Vec<S> = self.into_iter().collect();
@@ -103,7 +103,7 @@ where
 impl<'a, const N: usize, S> LiftInto<Signal<'a, [S::Inner; N]>> for [S; N]
 where
     S: Liftable<'a>,
-    S::Inner: Clone + 'a,
+    S::Inner: 'a,
 {
     fn lift(self) -> Signal<'a, [S::Inner; N]> {
         Signal::<S::Inner>::lift_from_array::<S, N>(self)
@@ -115,8 +115,8 @@ impl<'a, S1, S2> LiftIntoSync<SignalSync<'a, (S1::Inner, S2::Inner)>> for (S1, S
 where
     S1: LiftableSync<'a>,
     S2: LiftableSync<'a>,
-    S1::Inner: Clone + Send + Sync + 'a,
-    S2::Inner: Clone + Send + Sync + 'a,
+    S1::Inner: Send + Sync + 'a,
+    S2::Inner: Send + Sync + 'a,
 {
     fn lift(self) -> SignalSync<'a, (S1::Inner, S2::Inner)> {
         self.0.as_ref().combine(self.1.as_ref())
@@ -127,7 +127,7 @@ impl<'a, S, I> LiftIntoSync<SignalSync<'a, Vec<S::Inner>>> for I
 where
     S: LiftableSync<'a>,
     I: IntoIterator<Item = S> + Mutable,
-    S::Inner: Clone + Send + Sync + 'a,
+    S::Inner: Send + Sync + 'a,
 {
     fn lift(self) -> SignalSync<'a, Vec<S::Inner>> {
         let mut items: Vec<S> = self.into_iter().collect();
@@ -143,7 +143,7 @@ where
 impl<'a, const N: usize, S> LiftIntoSync<SignalSync<'a, [S::Inner; N]>> for [S; N]
 where
     S: LiftableSync<'a>,
-    S::Inner: Clone + Send + Sync + 'a,
+    S::Inner: Send + Sync + 'a,
 {
     fn lift(self) -> SignalSync<'a, [S::Inner; N]> {
         SignalSync::<S::Inner>::lift_from_array::<S, N>(self)
