@@ -160,6 +160,10 @@ impl<'a, T: 'a> Signal<'a, T> {
         self.guard()
     }
 
+    pub fn set(&mut self, signal: Signal<'a, T>) {
+        self.0 = signal.0;
+    }
+
     /// Map the signal to a new signal
     ///
     /// This creates a new signal that depends on the current signal.
@@ -558,11 +562,14 @@ impl<'a, T: 'a> Signal<'a, T> {
     /// This synchronizes the value of this signal with the value of the dependency signal.
     /// Whenever the dependency signal changes, this signal will be updated to match its value.
     ///
+    /// The returned signal is exactly the argument `dependency`. You can break the dependency chain
+    /// by dropping the returned signal if `dependency` is weakly referenced.
+    ///
     /// # Example
     /// ```rust
     /// let a = Signal::new(1);
-    /// let b = Signal::new(2);
-    /// a.depend(&b);
+    /// let mut b = Signal::new(2);
+    /// b = a.depend(b);
     /// a.with(|v| println!("a changed: {}", v));
     /// b.send(3); // prints "a changed: 3"
     /// ```
@@ -574,7 +581,7 @@ impl<'a, T: 'a> Signal<'a, T> {
     /// b.with(|v| println!("b changed: {}", v));
     /// a.send(3); // prints "b changed: 3"
     /// ```
-    pub fn depend(&self, dependency: &Signal<'a, T>)
+    pub fn depend(&self, dependency: Signal<'a, T>) -> Signal<'a, T>
     where
         T: Clone,
     {
@@ -598,6 +605,7 @@ impl<'a, T: 'a> Signal<'a, T> {
             .successors
             .borrow_mut()
             .push(WeakSignalRef::new(self));
+        dependency
     }
 
     pub(crate) fn modify(&self, f: impl FnOnce(&mut T)) {
@@ -878,8 +886,8 @@ mod tests {
         let _observer_b = b.map(|x| println!("b changed: {}", x));
         let _observer_c = c.map(|x| println!("c changed: {}", x));
 
-        c.depend(&b.with(|x| x * 2));
-        b.depend(&a);
+        c.depend(b.with(|x| x * 2));
+        b.depend(a.clone());
 
         a.send(42);
     }
@@ -895,19 +903,5 @@ mod tests {
         let _observer_c = c.map(|x| println!("c changed: {}", x));
 
         (a.send(42), b.send(88));
-    }
-
-    #[test]
-    fn test_with() {
-        let a = Signal::new(10);
-        let b = a.with(|x| x * 2);
-
-        a.with(|x| println!("a changed: {}", x));
-        b.with(|x| println!("b changed: {}", x));
-
-        println!("--- Sending to a ---");
-        a.send(5);
-        println!("--- Sending to a again ---");
-        a.send(20);
     }
 }

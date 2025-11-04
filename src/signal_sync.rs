@@ -299,15 +299,6 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
         result_new_signal
     }
 
-    /// Alias for `contramap` (preserves naming similarity with non-sync API)
-    pub fn comap<F, U>(&self, f: F) -> SignalSync<'a, U>
-    where
-        F: Fn(&U) -> T + Send + Sync + 'a,
-        U: Default + Send + Sync + 'a,
-    {
-        self.contramap(f)
-    }
-
     /// Map the signal bidirectionally to a new signal
     ///
     /// This creates a new signal that depends on the current signal,
@@ -593,11 +584,14 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     /// This synchronizes the value of this signal with the value of the dependency signal.
     /// Whenever the dependency signal changes, this signal will be updated to match its value.
     ///
+    /// The returned signal is exactly the argument `dependency`. You can break the dependency chain
+    /// by dropping the returned signal if `dependency` is weakly referenced.
+    ///
     /// # Example
     /// ```rust
     /// let a = SignalSync::new(1);
-    /// let b = SignalSync::new(2);
-    /// a.depend(&b);
+    /// let mut b = SignalSync::new(2);
+    /// b = a.depend(b);
     /// a.with(|v| println!("a changed: {}", v));
     /// b.send(3); // prints "a changed: 3"
     /// ```
@@ -609,7 +603,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
     /// b.with(|v| println!("b changed: {}", v));
     /// a.send(3); // prints "b changed: 3"
     /// ```
-    pub fn depend(&self, dependency: &SignalSync<'a, T>)
+    pub fn depend(&self, dependency: SignalSync<'a, T>) -> SignalSync<'a, T>
     where
         T: Clone,
     {
@@ -634,6 +628,7 @@ impl<'a, T: Send + Sync + 'a> SignalSync<'a, T> {
             .write()
             .unwrap()
             .push(WeakSignalRefSync::new(self));
+        dependency
     }
 
     /// Apply a modification function to the stored value (thread-safe)
@@ -787,6 +782,7 @@ impl<'a, T> AsRef<SignalSync<'a, T>> for SignalSync<'a, T> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -818,8 +814,8 @@ mod tests {
     #[test]
     fn test_signal5() {
         let result = SignalSync::new(42);
-        let source1 = result.comap(|x| x + 1);
-        let source2 = source1.comap(|x| x * 2);
+        let source1 = result.contramap(|x| x + 1);
+        let source2 = source1.contramap(|x| x * 2);
 
         let _observer_1 = result.map(|x| println!("result changed: {}", x));
         let _observer_2 = source1.map(|x| println!("source1 changed: {}", x));
@@ -835,16 +831,16 @@ mod tests {
 
     #[test]
     fn test_depend_sync() {
-        let a = SignalSync::new(10);
-        let b = SignalSync::new(10);
+        let mut a = SignalSync::new(10);
+        let mut b = SignalSync::new(10);
         let c = SignalSync::new(10);
 
         let _observer_a = a.map(|x| println!("a changed: {}", x));
         let _observer_b = b.map(|x| println!("b changed: {}", x));
         let _observer_c = c.map(|x| println!("c changed: {}", x));
 
-        c.depend(&b);
-        b.depend(&a);
+        b = c.depend(b);
+        a = b.depend(a);
 
         (a.send(42), b.send(88));
     }
